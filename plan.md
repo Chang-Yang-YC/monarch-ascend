@@ -416,3 +416,102 @@ Based on test results, the fix order should be:
 - HIXL documentation suggests `OPTION_AUTO_CONNECT` option might simplify connection management
 - HCCS (intra-supernode) path may work without explicit port configuration
 - ROCE (inter-supernode) path requires proper network configuration and port assignment
+
+---
+
+## Fix Progress (2026-03-10)
+
+### Fixes Applied
+
+1. **Issue 4: engine_id format** ✅ Fixed
+   - Changed from `ip:0` to `ip:port` format
+   - Using PID-based port allocation: `base_port + (pid % 1000)`
+   - Each process now has a unique listening port
+
+2. **Issue 3: Connection model** ✅ Fixed
+   - Each process now starts a listening server (port > 0)
+   - `HixlManagerActor::ensure_initialized` sets up `PROCESS_HIXL` with server mode
+
+3. **Issue 2: Double initialization** ✅ Fixed
+   - Consolidated to single `PROCESS_HIXL` global instance
+   - `HixlManagerActor` no longer holds its own HIXL instance
+
+4. **Initialization race condition** ✅ Fixed
+   - Added `wait_for_process_hixl()` function to wait for async initialization
+   - Prevents "HIXL not initialized" errors during early transfer attempts
+
+### Latest Test Results
+
+**Test Run: 2026-03-10 16:28**
+
+**Progress:**
+- All processes successfully initialize HIXL with unique ports:
+  - `learner_mesh`: `192.168.0.117:16859`
+  - `gen_mesh[0]`: `192.168.0.117:16059`
+  - `gen_mesh[1]`: `192.168.0.117:16259`
+- Servers are listening correctly
+- Connection attempts are being made
+
+**New Error:**
+```
+HIXL: connecting to remote engine: 192.168.0.117:16859
+Exception: failed to read into buffer: HIXL connect to 192.168.0.117:16859 failed: HIXL error 103900: HIXL_PARAM_INVALID
+```
+
+### Root Cause Analysis
+
+**HIXL_PARAM_INVALID (103900)** indicates HIXL cannot establish connection. Likely causes:
+
+1. **Network Configuration Required**: HIXL requires:
+   - **RDMA/RoCE**: RDMA-capable network interface (like InfiniBand or RoCE)
+   - **HCCS**: Huawei Chip-to-Chip interconnect for multi-NPU systems
+   - **Loopback not supported**: Same-host processes may not communicate via HIXL
+
+2. **HIXL Design Constraints**:
+   - HIXL is designed for cross-node or cross-NPU communication
+   - Local loopback connections may not be supported
+   - Requires physical RDMA/HCCS hardware
+
+### Suggested Solutions
+
+1. **Option A: Use separate nodes**
+   - Run `learner_mesh` and `gen_mesh` on different physical machines
+   - Ensure RDMA network is configured between nodes
+
+2. **Option B: Use HCCS (multi-NPU system)**
+   - If using multiple NPUs on same host, HIXL may use HCCS path
+   - Ensure NPU topology supports HCCS communication
+
+3. **Option C: Implement fallback for local communication**
+   - Detect when remote is local IP
+   - Use shared memory or IPC instead of HIXL for local transfers
+   - Only use HIXL for cross-node communication
+
+4. **Option D: Check HIXL configuration**
+   - Consult HIXL documentation for local communication support
+   - May need specific HIXL options or environment variables
+
+### Files Modified
+
+1. `monarch_rdma/src/rdma_manager_actor.rs`
+   - Added `allocate_hixl_port()` function
+   - Changed engine_id generation to include port
+
+2. `monarch_rdma/src/backend/hixl/manager_actor.rs`
+   - Rewrote to use single `PROCESS_HIXL` instance
+   - Added `wait_for_process_hixl()` for initialization sync
+   - Added `hixl_transfer_sync()` with connection management
+
+### Next Steps
+
+1. **Verify network configuration**:
+   - Check if RDMA/HCCS is available: `ibv_devinfo` or Huawei NPU tools
+   - Ensure proper network interface for HIXL
+
+2. **Test with HIXL examples**:
+   - Run HIXL's `server_server_d2d` example to verify HIXL works
+   - If example fails, network configuration is the issue
+
+3. **Consider local fallback**:
+   - Implement fallback for same-host communication
+   - Use CPU copy or shared memory for local transfers

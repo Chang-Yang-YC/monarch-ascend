@@ -305,13 +305,127 @@ impl RdmaManagerActor {
 }
 
 /// HIXL configuration for the RdmaManagerActor.
-#[cfg(feature = "hixl")]
-#[derive(Debug, Named, Clone, Serialize, Deserialize, Default)]
-pub struct HixlConfig {
-    pub engine_id: Option<String>,
-}
 
 #[cfg(feature = "hixl")]
+
+#[derive(Debug, Named, Clone, Serialize, Deserialize, Default)]
+
+pub struct HixlConfig {
+
+    /// Explicit engine_id (ip:port format). If not set, auto-generated.
+
+    pub engine_id: Option<String>,
+
+    /// Listening port for HIXL server. If not set, auto-assigned from HIXL_BASE_PORT + counter.
+
+    pub port: Option<u16>,
+
+}
+
+
+
+/// Get the base port for HIXL from environment variable or default.
+
+
+
+#[cfg(feature = "hixl")]
+
+
+
+fn hixl_base_port() -> u16 {
+
+
+
+    std::env::var("HIXL_BASE_PORT")
+
+
+
+        .ok()
+
+
+
+        .and_then(|s| s.parse().ok())
+
+
+
+        .unwrap_or(16000)
+
+
+
+}
+
+
+
+
+
+
+
+/// Allocate a unique port for this RdmaManagerActor instance.
+
+
+
+/// Uses process ID to ensure uniqueness across different processes.
+
+
+
+#[cfg(feature = "hixl")]
+
+
+
+fn allocate_hixl_port(configured_port: Option<u16>) -> u16 {
+
+
+
+    if let Some(port) = configured_port {
+
+
+
+        return port;
+
+
+
+    }
+
+
+
+    // Use process ID to generate a unique port offset.
+
+
+
+    // This ensures different processes get different ports even if they run concurrently.
+
+
+
+    let pid = std::process::id();
+
+
+
+    // Use modulo to keep ports in a reasonable range
+
+
+
+    let offset = (pid % 1000) as u16;
+
+
+
+    let port = hixl_base_port() + offset;
+
+
+
+    // Ensure port doesn't exceed max valid port
+
+
+
+    port.min(65535)
+
+
+
+}
+
+
+
+#[cfg(feature = "hixl")]
+
 pub(crate) fn local_ip_for_hixl() -> String {
     // Try to get a non-loopback IPv4 address
     if let Ok(hostname) = hostname::get() {
@@ -338,13 +452,16 @@ impl RemoteSpawn for RdmaManagerActor {
 
     async fn new(params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
         let config = params.unwrap_or_default();
+        
+        // Generate engine_id with listening port for server-server model
         let engine_id = config.engine_id.unwrap_or_else(|| {
-            // HIXL expects `ip:port` or `ip` format for engine_id.
-            // port=0 or omitting port uses HCCS for intra-node communication.
-            // For unique identification, use ip:0 (no server listen).
             let ip = local_ip_for_hixl();
-            format!("{}:0", ip)
+            let port = allocate_hixl_port(config.port);
+            tracing::info!("HIXL: allocated port {} for engine_id", port);
+            format!("{}:{}", ip, port)
         });
+        
+        tracing::info!("HIXL: RdmaManagerActor using engine_id={}", engine_id);
         let hixl_actor = HixlManagerActor::new(engine_id);
         let hixl = RdmaBackendActor::Created(hixl_actor);
         Ok(Self {

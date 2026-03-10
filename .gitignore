@@ -44,3 +44,6 @@ docs/**/generated/**
 
 # Ascend NPU build artifacts
 kernel_meta/
+
+# HIXL reference source code
+ref_hixl/

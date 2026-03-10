@@ -12,8 +12,12 @@
 //! memory registrations, and single-sided data transfers over HCCS (intra-supernode)
 //! and RDMA/RoCE (inter-supernode).
 //!
-//! Mirrors [`IbvManagerActor`] in structure: the parent [`RdmaManagerActor`] spawns
-//! one `HixlManagerActor` per process and delegates transport-specific work to it.
+//! ## Design
+//!
+//! All HIXL operations go through the global `PROCESS_HIXL` static, which holds
+//! a single HIXL instance per process. The `HixlManagerActor` initializes this
+//! instance during its first use and provides actor-based message handling for
+//! buffer registration/release.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -74,15 +78,15 @@ pub enum HixlManagerMessage {
 wirevalue::register_type!(HixlManagerMessage);
 
 /// Per-process global HIXL context for transfer operations.
-/// The `HixlManagerActor` initializes this during its first `request_buffer` call.
-/// Transfer operations in `rdma_components.rs` use this to execute transfers
-/// without going through actor message passing (avoiding deadlocks).
+/// Initialized once by `HixlManagerActor` and used by all transfer operations.
 static PROCESS_HIXL: OnceLock<Mutex<ProcessHixl>> = OnceLock::new();
 
+/// Per-process HIXL state including engine instance, connections, and registrations.
 struct ProcessHixl {
     engine_id: String,
     hixl: hixl_sys::Hixl,
     connected_peers: HashMap<String, bool>,
+    registered_buffers: HashMap<usize, SendMemHandle>,
 }
 
 // Safety: hixl_sys::Hixl internally manages thread safety.
@@ -94,27 +98,96 @@ impl ProcessHixl {
         if self.connected_peers.contains_key(remote_engine) {
             return Ok(());
         }
+        tracing::info!("HIXL: connecting to remote engine: {}", remote_engine);
         self.hixl.connect(remote_engine, timeout_ms)
             .map_err(|e| anyhow::anyhow!("HIXL connect to {} failed: {}", remote_engine, e))?;
         self.connected_peers.insert(remote_engine.to_string(), true);
-        tracing::info!("HIXL connected to remote engine: {}", remote_engine);
+        tracing::info!("HIXL: connected to remote engine: {}", remote_engine);
+        Ok(())
+    }
+
+    fn register_memory(
+        &mut self,
+        buf_id: usize,
+        addr: usize,
+        size: usize,
+        mem_type: hixl_sys::HixlMemType,
+    ) -> Result<SendMemHandle> {
+        let handle = self.hixl.register_mem(addr, size, mem_type)
+            .map_err(|e| anyhow::anyhow!("HIXL register_mem failed: {}", e))?;
+        let mem_handle = SendMemHandle(handle);
+        self.registered_buffers.insert(buf_id, mem_handle);
+        Ok(mem_handle)
+    }
+
+    fn deregister_memory(&mut self, buf_id: usize) -> Result<()> {
+        if let Some(mem_handle) = self.registered_buffers.remove(&buf_id) {
+            self.hixl.deregister_mem(mem_handle.0)
+                .map_err(|e| anyhow::anyhow!("HIXL deregister_mem failed: {}", e))?;
+        }
         Ok(())
     }
 }
 
-fn ensure_process_hixl() -> Result<()> {
-    PROCESS_HIXL.get_or_init(|| {
-        let hixl = hixl_sys::Hixl::new().expect("Failed to create HIXL instance");
-        let ip = crate::rdma_manager_actor::local_ip_for_hixl();
-        let engine_id = format!("{}:0", ip);
-        hixl.initialize(&engine_id, &[]).expect("HIXL initialize failed");
-        tracing::warn!("HIXL: lazy-initialized process-global context with id: {}", engine_id);
-        Mutex::new(ProcessHixl {
-            engine_id,
-            hixl,
-            connected_peers: HashMap::new(),
-        })
-    });
+/// Initialize the process-global HIXL instance with the given engine_id.
+/// Called once by `HixlManagerActor` during initialization.
+fn init_process_hixl(engine_id: String) -> Result<()> {
+    if PROCESS_HIXL.get().is_some() {
+        tracing::warn!("HIXL: PROCESS_HIXL already initialized, skipping");
+        return Ok(());
+    }
+
+    tracing::info!("HIXL: creating instance with engine_id={}", engine_id);
+    let hixl = hixl_sys::Hixl::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create HIXL instance: {}", e))?;
+    
+    // Initialize with listening port (port > 0 enables server mode)
+    tracing::info!("HIXL: initializing with engine_id={}", engine_id);
+    hixl.initialize(&engine_id, &[])
+        .map_err(|e| anyhow::anyhow!("HIXL initialize failed: {}", e))?;
+    tracing::info!("HIXL: engine initialized successfully, server listening on {}", engine_id);
+
+    let _ = PROCESS_HIXL.set(Mutex::new(ProcessHixl {
+        engine_id: engine_id.clone(),
+        hixl,
+        connected_peers: HashMap::new(),
+        registered_buffers: HashMap::new(),
+    }));
+
+    tracing::info!("HIXL: global PROCESS_HIXL initialized with engine_id={}", engine_id);
+    Ok(())
+}
+
+/// Get the engine_id from the process-global HIXL instance.
+pub fn get_engine_id() -> Option<String> {
+    PROCESS_HIXL.get().and_then(|px| {
+        px.lock().ok().map(|guard| guard.engine_id.clone())
+    })
+}
+
+/// Wait for PROCESS_HIXL to be initialized, with a timeout.
+/// This is needed because HixlManagerActor::init runs asynchronously,
+/// and we need to ensure PROCESS_HIXL is ready before any transfer.
+fn wait_for_process_hixl(timeout_ms: i32) -> Result<()> {
+    // Check if already initialized
+    if PROCESS_HIXL.get().is_some() {
+        return Ok(());
+    }
+
+    // Wait for initialization with timeout
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+    
+    while PROCESS_HIXL.get().is_none() {
+        if start.elapsed() > timeout {
+            return Err(anyhow::anyhow!(
+                "HIXL not initialized after {}ms - ensure HixlManagerActor is spawned first",
+                timeout_ms
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    
     Ok(())
 }
 
@@ -128,10 +201,12 @@ pub fn hixl_transfer_sync(
     transfer_op: hixl_sys::HixlTransferOp,
     timeout_ms: i32,
 ) -> Result<()> {
-    ensure_process_hixl()?;
+    // Wait for HIXL to be initialized (may be still initializing in background)
+    wait_for_process_hixl(timeout_ms)?;
+    
     let process_hixl = PROCESS_HIXL
         .get()
-        .ok_or_else(|| anyhow::anyhow!("HIXL not initialized"))?;
+        .ok_or_else(|| anyhow::anyhow!("HIXL not initialized - ensure HixlManagerActor is spawned first"))?;
     let mut guard = process_hixl
         .lock()
         .map_err(|e| anyhow::anyhow!("HIXL lock poisoned: {}", e))?;
@@ -164,8 +239,8 @@ pub fn hixl_transfer_sync(
     result.map_err(|e| anyhow::anyhow!("HIXL transfer to {} failed: {}", remote_engine_id, e))
 }
 
-/// HIXL manager actor — manages a persistent HIXL engine instance, peer
-/// connections, and memory registrations for single-sided transfers.
+/// HIXL manager actor — initializes the process-global HIXL instance and
+/// handles buffer registration/release messages.
 #[derive(Debug)]
 #[hyperactor::export(
     handlers = [
@@ -175,9 +250,6 @@ pub fn hixl_transfer_sync(
 pub struct HixlManagerActor {
     owner: OnceLock<ActorHandle<RdmaManagerActor>>,
     engine_id: String,
-    hixl: Option<hixl_sys::Hixl>,
-    connected_peers: HashMap<String, bool>,
-    registered_buffers: HashMap<usize, SendMemHandle>,
 }
 
 impl HixlManagerActor {
@@ -185,81 +257,25 @@ impl HixlManagerActor {
         Self {
             owner: OnceLock::new(),
             engine_id,
-            hixl: None,
-            connected_peers: HashMap::new(),
-            registered_buffers: HashMap::new(),
         }
-    }
-
-    fn ensure_initialized(&mut self) -> Result<&hixl_sys::Hixl> {
-        if self.hixl.is_none() {
-            tracing::warn!("HIXL: creating instance...");
-            let hixl = hixl_sys::Hixl::new()
-                .map_err(|e| anyhow::anyhow!("Failed to create HIXL instance: {}", e))?;
-            tracing::warn!("HIXL: instance created, initializing with engine_id={}...", self.engine_id);
-            hixl.initialize(&self.engine_id, &[])
-                .map_err(|e| anyhow::anyhow!("HIXL initialize failed: {}", e))?;
-            tracing::warn!("HIXL: engine initialized with id: {}", self.engine_id);
-
-            // Also set up the process-global HIXL for transfer operations.
-            // Reuse the same engine_id with port=0 (HCCS mode) for the global context.
-            let global_hixl = hixl_sys::Hixl::new()
-                .map_err(|e| anyhow::anyhow!("Failed to create global HIXL instance: {}", e))?;
-            let xfer_engine_id = format!("{}:0", crate::rdma_manager_actor::local_ip_for_hixl());
-            global_hixl.initialize(&xfer_engine_id, &[])
-                .map_err(|e| anyhow::anyhow!("Global HIXL initialize failed: {}", e))?;
-
-            let _ = PROCESS_HIXL.set(Mutex::new(ProcessHixl {
-                engine_id: self.engine_id.clone(),
-                hixl: global_hixl,
-                connected_peers: HashMap::new(),
-            }));
-
-            self.hixl = Some(hixl);
-        }
-        Ok(self.hixl.as_ref().unwrap())
-    }
-
-    fn register_memory(
-        &mut self,
-        addr: usize,
-        size: usize,
-        mem_type: hixl_sys::HixlMemType,
-    ) -> Result<SendMemHandle> {
-        let hixl = self.ensure_initialized()?;
-        let handle = hixl.register_mem(addr, size, mem_type)
-            .map_err(|e| anyhow::anyhow!("HIXL register_mem failed: {}", e))?;
-        Ok(SendMemHandle(handle))
     }
 }
 
 #[async_trait]
 impl Actor for HixlManagerActor {
-    async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
-        let owner = if let Some(owner) = this.parent_handle() {
-            owner
-        } else {
-            anyhow::bail!("RdmaManagerActor not found as parent of HixlManagerActor");
-        };
-        self.owner
-            .set(owner)
-            .expect("owner should only be set once during init");
+    async fn init(&mut self, _this: &Instance<Self>) -> Result<(), anyhow::Error> {
+        // Initialize the process-global HIXL instance
+        init_process_hixl(self.engine_id.clone())?;
+        tracing::info!("HixlManagerActor initialized with engine_id={}", self.engine_id);
         Ok(())
     }
 }
 
 impl Drop for HixlManagerActor {
     fn drop(&mut self) {
-        for (_buf_id, mem_handle) in self.registered_buffers.drain() {
-            if let Some(ref hixl) = self.hixl {
-                let _ = hixl.deregister_mem(mem_handle.0);
-            }
-        }
-        for (peer, _) in self.connected_peers.drain() {
-            if let Some(ref hixl) = self.hixl {
-                let _ = hixl.disconnect(&peer, 5000);
-            }
-        }
+        // Note: We don't clean up PROCESS_HIXL here because it may still be in use
+        // by ongoing transfers. The HIXL instance will be cleaned up when the process exits.
+        tracing::info!("HixlManagerActor dropped (engine_id={})", self.engine_id);
     }
 }
 
@@ -273,14 +289,23 @@ impl HixlManagerMessageHandler for HixlManagerActor {
         addr: usize,
         size: usize,
     ) -> Result<Option<HixlBuffer>, anyhow::Error> {
-        tracing::warn!("HIXL request_buffer: id={} addr={:#x} size={}", remote_buf_id, addr, size);
-        let mem_handle = self.register_memory(
+        tracing::debug!("HIXL request_buffer: id={} addr={:#x} size={}", remote_buf_id, addr, size);
+        
+        let process_hixl = PROCESS_HIXL
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("HIXL not initialized"))?;
+        let mut guard = process_hixl
+            .lock()
+            .map_err(|e| anyhow::anyhow!("HIXL lock poisoned: {}", e))?;
+
+        guard.register_memory(
+            remote_buf_id,
             addr,
             size,
             hixl_sys::HixlMemType::HIXL_MEM_DEVICE,
         )?;
-        tracing::warn!("HIXL request_buffer: register_memory done for id={}", remote_buf_id);
-        self.registered_buffers.insert(remote_buf_id, mem_handle);
+
+        tracing::debug!("HIXL request_buffer: registered id={}", remote_buf_id);
 
         Ok(Some(HixlBuffer {
             engine_id: self.engine_id.clone(),
@@ -294,12 +319,14 @@ impl HixlManagerMessageHandler for HixlManagerActor {
         _cx: &Context<Self>,
         remote_buf_id: usize,
     ) -> Result<(), anyhow::Error> {
-        if let Some(mem_handle) = self.registered_buffers.remove(&remote_buf_id) {
-            if let Some(ref hixl) = self.hixl {
-                hixl.deregister_mem(mem_handle.0)
-                    .map_err(|e| anyhow::anyhow!("HIXL deregister_mem failed: {}", e))?;
-            }
-        }
+        let process_hixl = PROCESS_HIXL
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("HIXL not initialized"))?;
+        let mut guard = process_hixl
+            .lock()
+            .map_err(|e| anyhow::anyhow!("HIXL lock poisoned: {}", e))?;
+
+        guard.deregister_memory(remote_buf_id)?;
         Ok(())
     }
 }
