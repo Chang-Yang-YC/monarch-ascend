@@ -42,8 +42,15 @@ use pyo3::types::PyTuple;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
+#[cfg(feature = "cuda_backend")]
 use torch_sys_cuda::nccl::ReduceOp;
+#[cfg(feature = "cuda_backend")]
 use torch_sys_cuda::nccl::UniqueId;
+
+#[cfg(feature = "ascend_backend")]
+use torch_sys_ascend::hccl::ReduceOp;
+#[cfg(feature = "ascend_backend")]
+use torch_sys_ascend::hccl::RootInfo as UniqueId;
 use torch_sys2::BorrowError;
 use torch_sys2::Device;
 use torch_sys2::Layout;

@@ -9,7 +9,13 @@
 //! # RDMA Manager Actor
 //!
 //! Per-process actor that owns RDMA buffer registrations and delegates
-//! transport-specific work to backend actors (currently [`IbvManagerActor`]).
+//! transport-specific work to backend actors.
+//!
+//! ## Backend Selection
+//!
+//! - **ibverbs** (default): Uses [`IbvManagerActor`] for RDMA over InfiniBand/RoCE.
+//! - **hixl** (feature `hixl`): Uses [`HixlManagerActor`] for HIXL over HCCS/RDMA
+//!   on Ascend NPUs.
 //!
 //! ## Responsibilities
 //!
@@ -18,7 +24,7 @@
 //! - Produces [`RdmaRemoteBuffer`] tokens that can be sent to remote peers so
 //!   they can address this buffer over RDMA.
 //! - Delegates MR registration, QP management, and data movement to the
-//!   ibverbs backend ([`IbvManagerActor`]).
+//!   selected backend.
 //! - Handles remote [`ReleaseBuffer`] requests to clean up registrations.
 
 use std::collections::HashMap;
@@ -42,17 +48,30 @@ use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::Flattrs;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::OnceCell;
 use typeuri::Named;
 
 use crate::RdmaLocalMemory;
 use crate::backend::RdmaBackendContext;
-use crate::backend::ibverbs::manager_actor::IbvManagerActor;
-use crate::backend::ibverbs::manager_actor::IbvManagerMessageClient;
-use crate::backend::ibverbs::primitives::IbvConfig;
 use crate::rdma_components::RdmaRemoteBuffer;
 
-/// Helper function to get detailed error messages from RDMAXCEL error codes
+// ---- ibverbs backend imports ----
+#[cfg(not(feature = "hixl"))]
+use tokio::sync::OnceCell;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::manager_actor::IbvManagerActor;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::manager_actor::IbvManagerMessageClient;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::primitives::IbvConfig;
+
+// ---- HIXL backend imports ----
+#[cfg(feature = "hixl")]
+use crate::backend::hixl::manager_actor::HixlManagerActor;
+#[cfg(feature = "hixl")]
+use crate::backend::hixl::manager_actor::HixlManagerMessageClient;
+
+/// Helper function to get detailed error messages from RDMAXCEL error codes.
+#[cfg(not(feature = "hixl"))]
 pub fn get_rdmaxcel_error_message(error_code: i32) -> String {
     unsafe {
         let c_str = rdmaxcel_sys::rdmaxcel_error_string(error_code);
@@ -96,11 +115,13 @@ wirevalue::register_type!(ReleaseBuffer);
 
 /// Serializable query for resolving the [`IbvManagerActor`] ref
 /// from a remote [`RdmaManagerActor`]. Only used in testing.
+#[cfg(not(feature = "hixl"))]
 #[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
 pub struct GetIbvActorRef {
     #[reply]
     pub reply: OncePortRef<Option<ActorRef<IbvManagerActor>>>,
 }
+#[cfg(not(feature = "hixl"))]
 wirevalue::register_type!(GetIbvActorRef);
 
 #[derive(Debug)]
@@ -132,6 +153,11 @@ impl<A: Actor> RdmaBackendActor<A> {
     }
 }
 
+// ============================================================================
+// ibverbs backend (default)
+// ============================================================================
+
+#[cfg(not(feature = "hixl"))]
 #[derive(Debug)]
 #[hyperactor::export(
     spawn = true,
@@ -146,9 +172,8 @@ pub struct RdmaManagerActor {
     ibverbs: RdmaBackendActor<IbvManagerActor>,
 }
 
+#[cfg(not(feature = "hixl"))]
 impl RdmaManagerActor {
-    /// Construct an [`ActorHandle`] for the [`RdmaManagerActor`] co-located
-    /// with the caller.
     pub fn local_handle(client: &impl context::Actor) -> ActorHandle<Self> {
         let proc_id = client.mailbox().actor_id().0.clone();
         let actor_ref = ActorRef::attest(ActorId(proc_id, "rdma_manager".to_string(), 0));
@@ -158,6 +183,7 @@ impl RdmaManagerActor {
     }
 }
 
+#[cfg(not(feature = "hixl"))]
 #[async_trait]
 impl RemoteSpawn for RdmaManagerActor {
     type Params = Option<IbvConfig>;
@@ -172,11 +198,12 @@ impl RemoteSpawn for RdmaManagerActor {
     }
 }
 
+#[cfg(not(feature = "hixl"))]
 #[async_trait]
 impl Actor for RdmaManagerActor {
     async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
         self.ibverbs.spawn(this)?;
-        tracing::debug!("RdmaManagerActor initialized with lazy domain/QP creation");
+        tracing::debug!("RdmaManagerActor initialized with ibverbs backend");
         Ok(())
     }
 
@@ -191,6 +218,7 @@ impl Actor for RdmaManagerActor {
     }
 }
 
+#[cfg(not(feature = "hixl"))]
 #[async_trait]
 #[hyperactor::handle(GetIbvActorRef)]
 impl GetIbvActorRefHandler for RdmaManagerActor {
@@ -202,6 +230,7 @@ impl GetIbvActorRefHandler for RdmaManagerActor {
     }
 }
 
+#[cfg(not(feature = "hixl"))]
 #[async_trait]
 #[hyperactor::handle(ReleaseBuffer)]
 impl ReleaseBufferHandler for RdmaManagerActor {
@@ -211,6 +240,7 @@ impl ReleaseBufferHandler for RdmaManagerActor {
     }
 }
 
+#[cfg(not(feature = "hixl"))]
 #[async_trait]
 #[hyperactor::handle(RdmaManagerMessage)]
 impl RdmaManagerMessageHandler for RdmaManagerActor {
@@ -233,6 +263,155 @@ impl RdmaManagerMessageHandler for RdmaManagerActor {
                 self.ibverbs.handle().bind(),
                 Arc::new(OnceCell::new()),
             )],
+        })
+    }
+
+    async fn request_local_memory(
+        &mut self,
+        _cx: &Context<Self>,
+        remote_buf_id: usize,
+    ) -> Result<Option<Arc<dyn RdmaLocalMemory>>, anyhow::Error> {
+        Ok(self.buffers.get(&remote_buf_id).cloned())
+    }
+}
+
+// ============================================================================
+// HIXL backend (Ascend NPU)
+// ============================================================================
+
+#[cfg(feature = "hixl")]
+#[derive(Debug)]
+#[hyperactor::export(
+    spawn = true,
+    handlers = [
+        ReleaseBuffer,
+    ],
+)]
+pub struct RdmaManagerActor {
+    next_remote_buf_id: usize,
+    buffers: HashMap<usize, Arc<dyn RdmaLocalMemory>>,
+    hixl: RdmaBackendActor<HixlManagerActor>,
+}
+
+#[cfg(feature = "hixl")]
+impl RdmaManagerActor {
+    pub fn local_handle(client: &impl context::Actor) -> ActorHandle<Self> {
+        let proc_id = client.mailbox().actor_id().0.clone();
+        let actor_ref = ActorRef::attest(ActorId(proc_id, "rdma_manager".to_string(), 0));
+        actor_ref
+            .downcast_handle(client)
+            .expect("RdmaManagerActor is not in the local process")
+    }
+}
+
+/// HIXL configuration for the RdmaManagerActor.
+#[cfg(feature = "hixl")]
+#[derive(Debug, Named, Clone, Serialize, Deserialize, Default)]
+pub struct HixlConfig {
+    pub engine_id: Option<String>,
+}
+
+#[cfg(feature = "hixl")]
+pub(crate) fn local_ip_for_hixl() -> String {
+    // Try to get a non-loopback IPv4 address
+    if let Ok(hostname) = hostname::get() {
+        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
+            &format!("{}:0", hostname.to_string_lossy()),
+        ) {
+            for addr in addrs {
+                if addr.is_ipv4() && !addr.ip().is_loopback() {
+                    return addr.ip().to_string();
+                }
+            }
+        }
+    }
+    // Fallback: use 0.0.0.0 (binds to all interfaces)
+    "0.0.0.0".to_string()
+}
+#[cfg(feature = "hixl")]
+wirevalue::register_type!(HixlConfig);
+
+#[cfg(feature = "hixl")]
+#[async_trait]
+impl RemoteSpawn for RdmaManagerActor {
+    type Params = Option<HixlConfig>;
+
+    async fn new(params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
+        let config = params.unwrap_or_default();
+        let engine_id = config.engine_id.unwrap_or_else(|| {
+            // HIXL expects `ip:port` or `ip` format for engine_id.
+            // port=0 or omitting port uses HCCS for intra-node communication.
+            // For unique identification, use ip:0 (no server listen).
+            let ip = local_ip_for_hixl();
+            format!("{}:0", ip)
+        });
+        let hixl_actor = HixlManagerActor::new(engine_id);
+        let hixl = RdmaBackendActor::Created(hixl_actor);
+        Ok(Self {
+            next_remote_buf_id: 0,
+            buffers: HashMap::new(),
+            hixl,
+        })
+    }
+}
+
+#[cfg(feature = "hixl")]
+#[async_trait]
+impl Actor for RdmaManagerActor {
+    async fn init(&mut self, this: &Instance<Self>) -> Result<(), anyhow::Error> {
+        self.hixl.spawn(this)?;
+        tracing::debug!("RdmaManagerActor initialized with HIXL backend");
+        Ok(())
+    }
+
+    async fn handle_supervision_event(
+        &mut self,
+        _cx: &Instance<Self>,
+        _event: &ActorSupervisionEvent,
+    ) -> Result<bool, anyhow::Error> {
+        tracing::error!("rdmaManagerActor supervision event: {:?}", _event);
+        tracing::error!("rdmaManagerActor error occurred, stop the worker process, exit code: 1");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(feature = "hixl")]
+#[async_trait]
+#[hyperactor::handle(ReleaseBuffer)]
+impl ReleaseBufferHandler for RdmaManagerActor {
+    async fn release_buffer(&mut self, cx: &Context<Self>, id: usize) -> Result<(), anyhow::Error> {
+        self.buffers.remove(&id);
+        self.hixl.handle().release_buffer(cx, id).await
+    }
+}
+
+#[cfg(feature = "hixl")]
+#[async_trait]
+#[hyperactor::handle(RdmaManagerMessage)]
+impl RdmaManagerMessageHandler for RdmaManagerActor {
+    async fn request_buffer(
+        &mut self,
+        cx: &Context<Self>,
+        local: Arc<dyn RdmaLocalMemory>,
+    ) -> Result<RdmaRemoteBuffer, anyhow::Error> {
+        let remote_buf_id = self.next_remote_buf_id;
+        self.next_remote_buf_id += 1;
+        let size = local.size();
+
+        let addr = local.addr();
+        tracing::warn!("RdmaManager: request_buffer id={} addr={:#x} size={}", remote_buf_id, addr, size);
+        self.buffers.insert(remote_buf_id, local);
+
+        tracing::warn!("RdmaManager: sending to HixlManagerActor...");
+        let hixl_buf = self.hixl.handle().request_buffer(cx, remote_buf_id, addr, size).await?
+            .ok_or_else(|| anyhow::anyhow!("HIXL request_buffer returned None for id {}", remote_buf_id))?;
+        tracing::warn!("RdmaManager: got HixlBuffer: {:?}", hixl_buf);
+
+        Ok(RdmaRemoteBuffer {
+            id: remote_buf_id,
+            size,
+            owner: cx.bind().clone(),
+            backends: vec![RdmaBackendContext::Hixl(hixl_buf)],
         })
     }
 

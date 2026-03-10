@@ -202,6 +202,11 @@ uv run python -c "from monarch import actor; print('Monarch installed successful
 USE_TENSOR_ENGINE=0 uv pip install -e .
 ```
 
+##### On Ascend machines*
+* TODO: complete env install instuctions
+* build :
+   USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e .
+
 ##### On non-CUDA machines
 
 You can also build Monarch on non-CUDA machines (e.g., macOS laptops) for

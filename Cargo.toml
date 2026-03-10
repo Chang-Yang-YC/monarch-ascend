@@ -35,5 +35,8 @@ members = [
     "timed_test",
     "torch-sys2",
     "torch-sys-cuda",
+    "torch-sys-ascend",
+    "hccl-sys",
+    "hixl-sys",
     "wirevalue",
 ]

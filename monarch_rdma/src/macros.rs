@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[cfg(not(feature = "hixl"))]
 #[macro_export]
 macro_rules! cu_check {
     ($result:expr) => {

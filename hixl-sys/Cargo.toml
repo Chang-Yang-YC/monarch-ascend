@@ -1,0 +1,13 @@
+[package]
+name = "hixl-sys"
+version = "0.0.0"
+authors = ["Meta"]
+edition = "2021"
+license = "BSD-3-Clause"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.70.1"
+build_utils = { path = "../build_utils" }
+cc = "1.0"

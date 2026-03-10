@@ -60,6 +60,7 @@ py_global!(torch_stack, "torch", "stack");
 pub enum DeviceType {
     CPU,
     CUDA,
+    NPU,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -122,6 +123,13 @@ impl std::fmt::Display for Device {
                     write!(f, "cuda")
                 }
             }
+            DeviceType::NPU => {
+                if let Some(index) = self.index {
+                    write!(f, "npu:{}", index.0)
+                } else {
+                    write!(f, "npu")
+                }
+            }
         }
     }
 }
@@ -146,6 +154,19 @@ impl std::str::FromStr for Device {
                 .map_err(|_| DeviceParseError::InvalidDevice)?;
             Ok(Device {
                 device_type: DeviceType::CUDA,
+                index: Some(DeviceIndex(index)),
+            })
+        } else if s == "npu" {
+            Ok(Device {
+                device_type: DeviceType::NPU,
+                index: None,
+            })
+        } else if let Some(npu_idx) = s.strip_prefix("npu:") {
+            let index = npu_idx
+                .parse::<i8>()
+                .map_err(|_| DeviceParseError::InvalidDevice)?;
+            Ok(Device {
+                device_type: DeviceType::NPU,
                 index: Some(DeviceIndex(index)),
             })
         } else {
@@ -175,6 +196,30 @@ impl CudaDevice {
 
     pub fn index(&self) -> DeviceIndex {
         self.index
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NpuDevice {
+    index: DeviceIndex,
+}
+
+impl NpuDevice {
+    pub fn new(index: DeviceIndex) -> Self {
+        NpuDevice { index }
+    }
+
+    pub fn index(&self) -> DeviceIndex {
+        self.index
+    }
+}
+
+impl From<NpuDevice> for Device {
+    fn from(npu_device: NpuDevice) -> Self {
+        Device {
+            device_type: DeviceType::NPU,
+            index: Some(npu_device.index),
+        }
     }
 }
 
@@ -507,6 +552,16 @@ impl Tensor {
         Python::attach(|py| {
             let tensor = self.inner.bind(py);
             tensor.getattr("is_cuda").unwrap().extract().unwrap()
+        })
+    }
+
+    pub fn is_npu(&self) -> bool {
+        Python::attach(|py| {
+            let tensor = self.inner.bind(py);
+            match tensor.getattr("is_npu") {
+                Ok(val) => val.extract().unwrap_or(false),
+                Err(_) => false,
+            }
         })
     }
 

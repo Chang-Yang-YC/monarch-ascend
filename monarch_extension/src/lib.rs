@@ -8,17 +8,17 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-#[cfg(feature = "tensor_engine")]
+#[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
 mod client;
 pub mod code_sync;
-#[cfg(feature = "tensor_engine")]
+#[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
 pub mod convert;
-#[cfg(feature = "tensor_engine")]
+#[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
 mod debugger;
-#[cfg(feature = "tensor_engine")]
+#[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
 mod mesh_controller;
 mod simulation_tools;
-#[cfg(feature = "tensor_engine")]
+#[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
 mod tensor_worker;
 
 mod blocking;
@@ -29,7 +29,7 @@ use pyo3::prelude::*;
 
 #[pyfunction]
 fn has_tensor_engine() -> bool {
-    cfg!(feature = "tensor_engine")
+    cfg!(any(feature = "tensor_engine", feature = "ascend_engine"))
 }
 
 fn get_or_add_new_module<'py>(
@@ -94,7 +94,7 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "monarch_hyperactor.value_mesh",
     )?)?;
 
-    #[cfg(feature = "tensor_engine")]
+    #[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
     {
         client::register_python_bindings(&get_or_add_new_module(
             module,
@@ -120,6 +120,9 @@ pub fn mod_init(module: &Bound<'_, PyModule>) -> PyResult<()> {
             module,
             "monarch_extension.mesh_controller",
         )?)?;
+    }
+    #[cfg(any(feature = "tensor_engine", feature = "ascend_engine"))]
+    {
         monarch_rdma_extension::register_python_bindings(&get_or_add_new_module(module, "rdma")?)?;
     }
     simulation_tools::register_python_bindings(&get_or_add_new_module(

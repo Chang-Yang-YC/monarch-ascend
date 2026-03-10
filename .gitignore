@@ -41,3 +41,6 @@ docs/**/generated/**
 
 .venv/**
 .vscode/**
+
+# Ascend NPU build artifacts
+kernel_meta/
