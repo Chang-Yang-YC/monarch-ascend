@@ -103,10 +103,74 @@ def get_cuda_home() -> Optional[str]:
     return None
 
 
+def get_ascend_home() -> Optional[str]:
+    """
+    Find Huawei Ascend CANN installation (architecture-specific toolkit root).
+
+    Returns:
+        Path to the arch-specific toolkit directory (e.g.
+        /usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux)
+        or None if not found.
+    """
+    import platform
+
+    arch = platform.machine()  # e.g. aarch64, x86_64
+    arch_suffix = f"{arch}-linux"
+
+    # 1. Explicit environment variable
+    ascend_home = os.environ.get("ASCEND_HOME")
+    if ascend_home and os.path.isdir(os.path.join(ascend_home, "include")):
+        return ascend_home
+
+    # 2. Walk the default toolkit location
+    toolkit_base = "/usr/local/Ascend/ascend-toolkit"
+    if os.path.isdir(toolkit_base):
+        # Prefer the "latest" symlink
+        latest = os.path.join(toolkit_base, "latest")
+        if os.path.exists(latest):
+            candidate = os.path.join(os.path.realpath(latest), arch_suffix)
+            if os.path.isdir(os.path.join(candidate, "include")):
+                return candidate
+
+        # Fall back to highest version
+        versions = sorted(
+            [
+                d
+                for d in os.listdir(toolkit_base)
+                if d not in ("latest", "set_env.sh")
+            ],
+            reverse=True,
+        )
+        for ver in versions:
+            candidate = os.path.join(toolkit_base, ver, arch_suffix)
+            if os.path.isdir(os.path.join(candidate, "include")):
+                return candidate
+
+    # 3. Try npu-smi in PATH
+    try:
+        result = subprocess.run(
+            ["which", "npu-smi"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            npu_smi = os.path.realpath(result.stdout.strip())
+            return os.path.dirname(os.path.dirname(npu_smi))
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return None
+
+
 # Build config detection
 torch_config = get_torch_config()
 cuda_home = get_cuda_home()
+ascend_home = get_ascend_home()
 use_tensor_engine = os.environ.get("USE_TENSOR_ENGINE", "1") == "1"
+use_ascend_engine = os.environ.get("USE_ASCEND_ENGINE", "0") == "1"
+
+# Auto-detect: if Ascend is available and CUDA is not, default to Ascend
+if not use_ascend_engine and ascend_home and not cuda_home:
+    use_ascend_engine = True
+    use_tensor_engine = False
 
 if use_tensor_engine and not torch_config:
     print("=" * 80)
@@ -123,15 +187,26 @@ if use_tensor_engine and not torch_config:
 
 build_tensor_engine = use_tensor_engine and torch_config is not None
 build_cuda = build_tensor_engine and cuda_home is not None
+build_ascend = use_ascend_engine and ascend_home is not None
 
 print("=" * 80)
-if build_tensor_engine:
-    print("✓ Building WITH tensor_engine (CUDA/GPU support)")
+if build_ascend:
+    print("Building WITH ascend_engine (Huawei Ascend NPU support)")
+    print(f"  - Ascend CANN: {ascend_home}")
+    if torch_config:
+        print(f"  - PyTorch: {torch_config['lib_path']}")
+        print(
+            f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}"
+        )
+elif build_tensor_engine:
+    print("Building WITH tensor_engine (CUDA/GPU support)")
     print(f"  - PyTorch: {torch_config['lib_path']}")
     print(f"  - CUDA: {cuda_home if build_cuda else 'Not found (CPU-only)'}")
-    print(f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}")
+    print(
+        f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}"
+    )
 else:
-    print("Building WITHOUT tensor_engine (CPU-only, no CUDA support)")
+    print("Building WITHOUT tensor_engine (CPU-only, no CUDA/NPU support)")
 print("=" * 80)
 
 # Set PYO3_PYTHON for Rust binaries
@@ -145,22 +220,28 @@ if os.environ.get("ENABLE_MESSAGE_LOGGING"):
 
 env_vars = {"RUSTFLAGS": " ".join(rustflags)}
 
-if build_tensor_engine:
-    cxx11_abi = torch_config["cxx11_abi"]
-    env_vars.update(
-        {
-            "CXXFLAGS": f"-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi}",
-            "LIBTORCH_LIB": torch_config["lib_path"],
-            "LIBTORCH_INCLUDE": ":".join(torch_config["include_paths"]),
-            "_GLIBCXX_USE_CXX11_ABI": str(cxx11_abi),
-            "TORCH_SYS_USE_PYTORCH_APIS": "0",
-        }
-    )
+if build_tensor_engine or build_ascend:
+    if torch_config:
+        cxx11_abi = torch_config["cxx11_abi"]
+        env_vars.update(
+            {
+                "CXXFLAGS": f"-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi}",
+                "LIBTORCH_LIB": torch_config["lib_path"],
+                "LIBTORCH_INCLUDE": ":".join(torch_config["include_paths"]),
+                "_GLIBCXX_USE_CXX11_ABI": str(cxx11_abi),
+                "TORCH_SYS_USE_PYTORCH_APIS": "0",
+            }
+        )
+    else:
+        env_vars["CXXFLAGS"] = "-D_GLIBCXX_USE_CXX11_ABI=1"
 else:
     env_vars["CXXFLAGS"] = "-D_GLIBCXX_USE_CXX11_ABI=1"
 
 if build_cuda:
     env_vars["CUDA_HOME"] = cuda_home
+
+if build_ascend:
+    env_vars["ASCEND_HOME"] = ascend_home
 
 os.environ.update(env_vars)
 
@@ -202,21 +283,27 @@ if sys.platform.startswith("linux"):
 
 
 # Extension Creation
-def create_cpp_extension(name: str, sources: List[str]) -> Extension:
+def create_cpp_extension(
+    name: str, sources: List[str], extra_macros: List[str] = None
+) -> Extension:
     """
     Create a C++ extension with torch dependencies.
 
     Args:
         name: Extension module name (e.g., "monarch.common._C")
         sources: List of source file paths
+        extra_macros: Optional list of preprocessor macro names to define
 
     Returns:
         Extension object configured for torch
     """
+    compile_args = ["-std=c++17", "-g", "-O3"]
+    for macro in extra_macros or []:
+        compile_args.append(f"-D{macro}")
     return Extension(
         name,
         sources,
-        extra_compile_args=["-std=c++17", "-g", "-O3"],
+        extra_compile_args=compile_args,
         libraries=["dl", "c10", "torch", "torch_cpu", "torch_python"],
         library_dirs=[torch_config["lib_path"]],
         include_dirs=[
@@ -244,6 +331,19 @@ if build_tensor_engine:
             ["python/monarch/gradient/_gradient_generator.cpp"],
         ),
     ]
+elif build_ascend and torch_config:
+    # Ascend build: include init.cpp but skip mock_cuda
+    ext_modules = [
+        create_cpp_extension(
+            "monarch.common._C",
+            ["python/monarch/common/init.cpp"],
+            extra_macros=["MONARCH_NO_CUDA_MOCK"],
+        ),
+        create_cpp_extension(
+            "monarch.gradient._gradient_generator",
+            ["python/monarch/gradient/_gradient_generator.cpp"],
+        ),
+    ]
 
 # Rust extensions
 rust_extensions = []
@@ -252,7 +352,10 @@ rust_extensions = []
 rust_features = ["extension-module", "distributed_sql_telemetry"]
 if build_tensor_engine:
     rust_features.append("tensor_engine")
+elif build_ascend:
+    rust_features.append("ascend_engine")
 
+has_engine = build_tensor_engine or build_ascend
 rust_extensions.append(
     RustExtension(
         "monarch._rust_bindings",
@@ -260,7 +363,7 @@ rust_extensions.append(
         path="monarch_extension/Cargo.toml",
         debug=False,
         features=rust_features,
-        args=[] if build_tensor_engine else ["--no-default-features"],
+        args=["--no-default-features"] if (build_ascend or not has_engine) else [],
     )
 )
 

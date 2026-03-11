@@ -1,0 +1,20 @@
+[package]
+name = "torch-sys-ascend"
+version = "0.0.0"
+authors = ["Meta"]
+edition = "2024"
+license = "BSD-3-Clause"
+links = "torch_ascend"
+
+[dependencies]
+derive_more = { version = "1.0.0", features = ["full"] }
+fxhash = "0.2.1"
+hccl-sys = { path = "../hccl-sys" }
+monarch_types = { version = "0.0.0", path = "../monarch_types" }
+pyo3 = { version = "0.26", features = ["anyhow", "multiple-pymethods", "py-clone"] }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+thiserror = "2.0.18"
+torch-sys2 = { version = "0.0.0", path = "../torch-sys2" }
+
+[build-dependencies]
+build_utils = { path = "../build_utils" }

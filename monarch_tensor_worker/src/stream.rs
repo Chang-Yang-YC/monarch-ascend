@@ -56,10 +56,11 @@ use pyo3::prelude::*;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use torch_sys_cuda::cuda::Event;
-use torch_sys_cuda::cuda::Stream;
 use torch_sys2::CloneUnsafe;
-use torch_sys2::CudaDevice;
+
+use crate::backend::AccelDevice;
+use crate::backend::Event;
+use crate::backend::Stream;
 use torch_sys2::TensorCell;
 use torch_sys2::deep_clone;
 use torch_sys2::factory_empty;
@@ -425,7 +426,7 @@ pub struct StreamActor {
     /// unexpected threads.
     cuda_stream: OnceLock<Option<Stream>>,
     /// Device this stream should be scheduled on.
-    device: Option<CudaDevice>,
+    device: Option<AccelDevice>,
     /// Communicator for this stream. Optional as we lazily initialize it.
     comm: Option<ActorHandle<NcclCommActor>>,
     /// Actor ref of the controller that created this stream.
@@ -448,7 +449,7 @@ pub struct StreamParams {
     pub id: StreamRef,
     /// Device this stream should be scheduled on. If none, don't do stream
     /// synchronization.
-    pub device: Option<CudaDevice>,
+    pub device: Option<AccelDevice>,
     /// Actor ref of the controller that created this stream.
     pub controller_actor: ActorRef<ControllerActor>,
     pub respond_with_python_message: bool,
@@ -1931,11 +1932,12 @@ mod tests {
     use pyo3::IntoPyObjectExt;
     use timed_test::async_timed_test;
     use tokio::sync::watch;
-    use torch_sys_cuda::nccl::UniqueId;
     use torch_sys2::factory_float_tensor;
     use torch_sys2::testing::allclose;
 
     use super::*;
+    use crate::backend::AccelDevice;
+    use crate::backend::CommId;
     use crate::comm::CommParams;
     use crate::test_util;
 
@@ -1983,7 +1985,7 @@ mod tests {
                     rank: 0,
                     creation_mode: StreamCreationMode::UseDefaultStream,
                     id: 0.into(),
-                    device: Some(CudaDevice::new(0.into())),
+                    device: Some(AccelDevice::new(0.into())),
                     controller_actor: controller_actor.clone(),
                     respond_with_python_message: false,
                 }),
@@ -2450,8 +2452,8 @@ mod tests {
         let dummy_comm = test_setup.proc.spawn(
             "comm",
             NcclCommActor::new(CommParams::New {
-                device: CudaDevice::new(0.into()),
-                unique_id: UniqueId::new()?,
+                device: AccelDevice::new(0.into()),
+                unique_id: CommId::new()?,
                 world_size: 1,
                 rank: 0,
             })

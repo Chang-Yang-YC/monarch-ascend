@@ -34,8 +34,15 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::types::PyTuple;
+#[cfg(feature = "tensor_engine")]
 use torch_sys_cuda::nccl::ReduceOp;
+#[cfg(feature = "tensor_engine")]
 use torch_sys_cuda::nccl::UniqueId;
+
+#[cfg(feature = "ascend_engine")]
+use torch_sys_ascend::hccl::ReduceOp;
+#[cfg(feature = "ascend_engine")]
+use torch_sys_ascend::hccl::RootInfo as UniqueId;
 
 struct MessageParser<'a> {
     current: Bound<'a, PyAny>,

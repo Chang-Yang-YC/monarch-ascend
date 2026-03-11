@@ -21,17 +21,18 @@ use hyperactor::handle;
 use hyperactor::mailbox::OncePortHandle;
 use parking_lot::Mutex;
 use tokio::task::spawn_blocking;
-use torch_sys_cuda::cuda::Event;
-use torch_sys_cuda::cuda::Stream;
-use torch_sys_cuda::nccl::Communicator;
-use torch_sys_cuda::nccl::NcclError;
-use torch_sys_cuda::nccl::NcclStatus;
-use torch_sys_cuda::nccl::ReduceOp;
-use torch_sys_cuda::nccl::UniqueId;
-use torch_sys_cuda::nccl::group_end;
-use torch_sys_cuda::nccl::group_start;
-use torch_sys2::CudaDevice;
 use torch_sys2::TensorCell;
+
+use crate::backend::AccelDevice;
+use crate::backend::CommError;
+use crate::backend::CommId;
+use crate::backend::CommStatus;
+use crate::backend::Communicator;
+use crate::backend::Event;
+use crate::backend::ReduceOp;
+use crate::backend::Stream;
+use crate::backend::group_end;
+use crate::backend::group_start;
 use typeuri::Named;
 
 /// Messages for NcclCommActor. See the underlying [`Communicator`] APIs for what
@@ -124,14 +125,14 @@ pub struct NcclCommActor {
 impl NcclCommActor {
     async fn collective<F>(&self, op_name: String, stream: Stream, op: F) -> Result<Event>
     where
-        F: FnOnce(Arc<Mutex<Communicator>>) -> Result<NcclStatus, NcclError> + Send + 'static,
+        F: FnOnce(Arc<Mutex<Communicator>>) -> Result<CommStatus, CommError> + Send + 'static,
     {
         let comm = self.comm.clone();
         spawn_blocking(move || {
             let status = op(comm)?;
             match status {
-                NcclStatus::Success => Ok(stream.record_event(None)),
-                _ => bail!("nccl {op_name} failed: {status:?}"),
+                CommStatus::Success => Ok(stream.record_event(None)),
+                _ => bail!("collective {op_name} failed: {status:?}"),
             }
         })
         .await?
@@ -147,9 +148,9 @@ pub enum CommParams {
     New {
         /// Device that this `Communicator` will use for compute. All streams
         /// passed to `NcclCommActor` are expected to be on this device.
-        device: CudaDevice,
-        /// NCCL UniqueID to coordinate group construction.
-        unique_id: UniqueId,
+        device: AccelDevice,
+        /// Unique ID / root info to coordinate group construction.
+        unique_id: CommId,
         /// Global world size.
         world_size: i32,
         /// This communicator's rank in the world.
@@ -391,7 +392,8 @@ impl CommMessageHandler for NcclCommActor {
                     _ => bail!("unsupported message type in group: {message:?}"),
                 }?;
             }
-            group_end(ticket)?;
+            let _ = ticket;
+            group_end()?;
             // Make an end event on this stream.
             Ok(stream.record_event(None))
         })
@@ -438,8 +440,8 @@ mod tests {
         let proc = Proc::local();
         let (client, _handle) = proc.instance("client").unwrap();
 
-        let unique_id = UniqueId::new().unwrap();
-        let device0 = CudaDevice::new(DeviceIndex(0));
+        let unique_id = CommId::new().unwrap();
+        let device0 = AccelDevice::new(DeviceIndex(0));
         let actor0 = NcclCommActor::new(CommParams::New {
             device: device0,
             unique_id: unique_id.clone(),
@@ -447,7 +449,7 @@ mod tests {
             rank: 0,
         });
 
-        let device1 = CudaDevice::new(DeviceIndex(1));
+        let device1 = AccelDevice::new(DeviceIndex(1));
         let actor1 = NcclCommActor::new(CommParams::New {
             device: device1,
             unique_id,
@@ -505,8 +507,8 @@ mod tests {
         let proc = Proc::local();
         let (client, _handle) = proc.instance("client").unwrap();
 
-        let unique_id = UniqueId::new().unwrap();
-        let device0 = CudaDevice::new(DeviceIndex(0));
+        let unique_id = CommId::new().unwrap();
+        let device0 = AccelDevice::new(DeviceIndex(0));
         let actor0 = NcclCommActor::new(CommParams::New {
             device: device0,
             unique_id: unique_id.clone(),
@@ -514,7 +516,7 @@ mod tests {
             rank: 0,
         });
 
-        let device1 = CudaDevice::new(DeviceIndex(1));
+        let device1 = AccelDevice::new(DeviceIndex(1));
         let actor1 = NcclCommActor::new(CommParams::New {
             device: device1,
             unique_id,
@@ -580,15 +582,15 @@ mod tests {
         let proc = Proc::local();
         let (client, _handle) = proc.instance("client")?;
 
-        let unique_id = UniqueId::new()?;
-        let device0 = CudaDevice::new(DeviceIndex(0));
+        let unique_id = CommId::new()?;
+        let device0 = AccelDevice::new(DeviceIndex(0));
         let actor0 = NcclCommActor::new(CommParams::New {
             device: device0,
             unique_id: unique_id.clone(),
             world_size: 2,
             rank: 0,
         });
-        let device1 = CudaDevice::new(DeviceIndex(1));
+        let device1 = AccelDevice::new(DeviceIndex(1));
         let actor1 = NcclCommActor::new(CommParams::New {
             device: device1,
             unique_id,
@@ -671,7 +673,7 @@ mod tests {
         }))
         .await?;
 
-        let unique_id = UniqueId::new().unwrap();
+        let unique_id = CommId::new().unwrap();
         let messages = vec![
             WorkerMessage::BackendNetworkInit(unique_id.clone()),
             WorkerMessage::CreateStream {
@@ -873,7 +875,7 @@ mod tests {
             )
             .unwrap();
 
-        let unique_id = UniqueId::new().unwrap();
+        let unique_id = CommId::new().unwrap();
 
         handle1
             .command_group(
@@ -1042,7 +1044,7 @@ mod tests {
             )
             .unwrap();
 
-        let unique_id = UniqueId::new().unwrap();
+        let unique_id = CommId::new().unwrap();
         handle
             .command_group(
                 &client,

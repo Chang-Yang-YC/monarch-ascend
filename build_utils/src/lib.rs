@@ -24,6 +24,7 @@ use glob::glob;
 use pyo3_build_config as _;
 use which::which;
 
+pub mod ascend;
 pub mod rocm;
 
 /// Python script to extract Python paths from sysconfig

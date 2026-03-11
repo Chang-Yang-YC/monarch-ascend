@@ -20,7 +20,6 @@ use monarch_rdma::RdmaLocalMemory;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
 use monarch_rdma::RdmaRemoteBuffer;
-use monarch_rdma::rdma_supported;
 use monarch_rdma::register_segment_scanner;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyException;
@@ -31,35 +30,27 @@ use pyo3::types::PyTuple;
 use pyo3::types::PyType;
 use typeuri::Named;
 
-/// Segment scanner callback that uses PyTorch's memory snapshot API.
-///
-/// This function calls torch.cuda.memory._snapshot() to get CUDA memory segments
-/// and fills the provided buffer with segment information.
-///
-/// # Safety
-/// This function is called from C code as a callback.
+// ---- GPU: ibverbs-specific imports and functions ----
+
+#[cfg(not(feature = "hixl"))]
+use monarch_rdma::rdma_supported;
+
+#[cfg(not(feature = "hixl"))]
 unsafe extern "C" fn pytorch_segment_scanner(
     segments_out: *mut monarch_rdma::rdmaxcel_sys::rdmaxcel_scanned_segment_t,
     max_segments: usize,
 ) -> usize {
-    // Acquire the GIL to call Python code
-    // Note: We use Python::attach here instead of monarch_with_gil_blocking because
-    // the raw pointer segments_out is not Sync and monarch_with_gil_blocking requires Send.
     let result = Python::attach(|py| -> PyResult<usize> {
-        // Check if torch is already imported - don't import it ourselves
         let sys = py.import("sys")?;
         let modules = sys.getattr("modules")?;
 
-        // Try to get torch from sys.modules
         let torch = match modules.get_item("torch") {
             Ok(torch_module) => torch_module,
             Err(_) => {
-                // torch not imported yet, return 0 segments
                 return Ok(0);
             }
         };
 
-        // Check if CUDA is available
         let cuda_available: bool = torch
             .getattr("cuda")?
             .getattr("is_available")?
@@ -70,30 +61,24 @@ unsafe extern "C" fn pytorch_segment_scanner(
             return Ok(0);
         }
 
-        // Call torch.cuda.memory._snapshot()
         let snapshot = torch
             .getattr("cuda")?
             .getattr("memory")?
             .getattr("_snapshot")?
             .call0()?;
 
-        // Get the segments list from the snapshot dict
         let segments = snapshot.get_item("segments")?;
         let segments_list: Vec<Bound<'_, PyAny>> = segments.extract()?;
 
         let num_segments = segments_list.len();
-
-        // Fill the output buffer with as many segments as will fit
         let segments_to_write = num_segments.min(max_segments);
 
         for (i, segment) in segments_list.iter().take(segments_to_write).enumerate() {
-            // Extract fields from the segment dict
             let address: u64 = segment.get_item("address")?.extract()?;
             let total_size: usize = segment.get_item("total_size")?.extract()?;
             let device: i32 = segment.get_item("device")?.extract()?;
             let is_expandable: bool = segment.get_item("is_expandable")?.extract()?;
 
-            // Write to the output buffer - only the fields the scanner needs to provide
             let seg_info = &mut *segments_out.add(i);
             seg_info.address = address as usize;
             seg_info.size = total_size;
@@ -101,22 +86,27 @@ unsafe extern "C" fn pytorch_segment_scanner(
             seg_info.is_expandable = if is_expandable { 1 } else { 0 };
         }
 
-        // Return total number of segments found (may be > max_segments)
         Ok(num_segments)
     });
 
     match result {
         Ok(count) => count,
         Err(e) => {
-            // Log the specific error for debugging
             eprintln!("[monarch_rdma] pytorch_segment_scanner failed: {}", e);
             0
         }
     }
 }
 
-/// A handle to a region of local memory that prevents the backing Python
-/// object from being garbage-collected while RDMA operations are in flight.
+// ---- NPU: HIXL-specific functions ----
+
+#[cfg(feature = "hixl")]
+fn hixl_rdma_supported() -> bool {
+    true
+}
+
+// ---- Common code ----
+
 #[pyclass(name = "_LocalMemoryHandle", module = "monarch._rust_bindings.rdma")]
 #[derive(Clone)]
 pub struct PyLocalMemoryHandle {
@@ -195,6 +185,17 @@ async fn create_rdma_buffer(
     Ok(PyRdmaBuffer { buffer })
 }
 
+fn is_rdma_supported() -> bool {
+    #[cfg(not(feature = "hixl"))]
+    {
+        rdma_supported()
+    }
+    #[cfg(feature = "hixl")]
+    {
+        hixl_rdma_supported()
+    }
+}
+
 #[pymethods]
 impl PyRdmaBuffer {
     #[classmethod]
@@ -204,7 +205,7 @@ impl PyRdmaBuffer {
         local: PyLocalMemoryHandle,
         client: PyInstance,
     ) -> PyResult<PyPythonTask> {
-        if !rdma_supported() {
+        if !is_rdma_supported() {
             return Err(PyException::new_err("RDMA is not supported on this system"));
         }
         PyPythonTask::new(create_rdma_buffer(local, client))
@@ -217,7 +218,7 @@ impl PyRdmaBuffer {
         local: PyLocalMemoryHandle,
         client: PyInstance,
     ) -> PyResult<PyRdmaBuffer> {
-        if !rdma_supported() {
+        if !is_rdma_supported() {
             return Err(PyException::new_err("RDMA is not supported on this system"));
         }
         signal_safe_block_on(py, create_rdma_buffer(local, client))?
@@ -225,7 +226,7 @@ impl PyRdmaBuffer {
 
     #[classmethod]
     fn rdma_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
-        rdma_supported()
+        is_rdma_supported()
     }
 
     #[pyo3(name = "__repr__")]
@@ -233,12 +234,6 @@ impl PyRdmaBuffer {
         format!("<RdmaBuffer'{:?}'>", self.buffer)
     }
 
-    /// Reads from this remote RDMA buffer into a local memory region.
-    ///
-    /// # Arguments
-    /// * `dst` - Local memory region to read into
-    /// * `client` - The actor performing the read
-    /// * `timeout` - Maximum time in seconds to wait for the operation
     fn read_into<'py>(
         &self,
         _py: Python<'py>,
@@ -260,12 +255,6 @@ impl PyRdmaBuffer {
         })
     }
 
-    /// Writes from a local memory region into this remote RDMA buffer.
-    ///
-    /// # Arguments
-    /// * `src` - Local memory region to write from
-    /// * `client` - The actor performing the write
-    /// * `timeout` - Maximum time in seconds to wait for the operation
     fn write_from<'py>(
         &self,
         _py: Python<'py>,
@@ -289,6 +278,32 @@ impl PyRdmaBuffer {
 
     fn size(&self) -> usize {
         self.buffer.size
+    }
+
+    /// Return external transport backend info ``(engine_id, addr)`` if present,
+    /// or ``None`` when the buffer uses a native Rust-managed backend (ibverbs).
+    ///
+    /// This is the generic hook that the Python transport registry uses to
+    /// route transfers to the appropriate plugin (e.g., HiXL, or any future
+    /// backend). Monarch core never needs to know *which* backend it is.
+    fn external_backend_info(&self) -> Option<(String, usize)> {
+        for ctx in &self.buffer.backends {
+            match ctx {
+                monarch_rdma::backend::RdmaBackendContext::External { engine_id, addr, .. } => {
+                    return Some((engine_id.clone(), *addr));
+                }
+                #[allow(unreachable_patterns)]
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Return the local engine_id assigned by the external transport, or None.
+    #[staticmethod]
+    fn local_external_engine_id() -> Option<String> {
+        std::env::var("MONARCH_PYTHON_HIXL_ENGINE_ID").ok()
+            .or_else(|| std::env::var("MONARCH_TRANSPORT_ENGINE_ID").ok())
     }
 
     fn __reduce__(&self) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
@@ -328,7 +343,7 @@ impl PyRdmaBuffer {
 
 #[pyclass(name = "_RdmaManager", module = "monarch._rust_bindings.rdma")]
 pub struct PyRdmaManager {
-    #[allow(dead_code)] // field never read
+    #[allow(dead_code)]
     inner: ActorMesh<RdmaManagerActor>,
     device: String,
 }
@@ -344,8 +359,7 @@ impl PyRdmaManager {
     fn device(&self) -> &str {
         &self.device
     }
-    /// Creates an RDMA manager actor on the given ProcMesh (async version).
-    /// Returns the actor mesh if RDMA is supported, None otherwise.
+
     #[classmethod]
     fn create_rdma_manager_nonblocking(
         _cls: &Bound<'_, PyType>,
@@ -357,24 +371,33 @@ impl PyRdmaManager {
         let proc_mesh = proc_mesh.downcast::<PyProcMesh>()?.borrow().mesh_ref()?;
         PyPythonTask::new(async move {
             let actor_mesh: ActorMesh<RdmaManagerActor> = proc_mesh
-                // Pass None to use default config - RdmaManagerActor will use default IbverbsConfig
-                // TODO - make IbverbsConfig configurable
                 .spawn_service(client.deref(), "rdma_manager", &None)
                 .await
                 .map_err(|err| PyException::new_err(err.to_string()))?;
 
+            let device_name = if cfg!(feature = "hixl") {
+                "hixl_rdma_device"
+            } else {
+                "remote_rdma_device"
+            };
+
             Ok(Some(PyRdmaManager {
                 inner: actor_mesh,
-                device: "remote_rdma_device".to_string(),
+                device: device_name.to_string(),
             }))
         })
     }
 }
 
 pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Register the PyTorch segment scanner callback.
-    // This calls torch.cuda.memory._snapshot() to get CUDA memory segments.
-    register_segment_scanner(Some(pytorch_segment_scanner));
+    #[cfg(not(feature = "hixl"))]
+    {
+        register_segment_scanner(Some(pytorch_segment_scanner));
+    }
+    #[cfg(feature = "hixl")]
+    {
+        register_segment_scanner(None);
+    }
 
     module.add_class::<PyLocalMemoryHandle>()?;
     module.add_class::<PyRdmaBuffer>()?;

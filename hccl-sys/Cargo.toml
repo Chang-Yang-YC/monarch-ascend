@@ -1,0 +1,15 @@
+[package]
+name = "hccl-sys"
+version = "0.0.0"
+authors = ["Meta"]
+edition = "2021"
+license = "BSD-3-Clause"
+links = "hccl"
+
+[dependencies]
+serde = { version = "1.0.185", features = ["derive", "rc"] }
+
+[build-dependencies]
+bindgen = "0.70.1"
+build_utils = { path = "../build_utils" }
+cc = "1.0"

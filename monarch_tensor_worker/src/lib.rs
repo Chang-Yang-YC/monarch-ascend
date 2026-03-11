@@ -27,6 +27,7 @@
 //! - debugger support
 //! - general drift in exisitng messages
 
+pub mod backend;
 mod borrow;
 mod comm;
 pub mod device_mesh;
@@ -90,9 +91,9 @@ use sorted_vec::SortedVec;
 use stream::StreamActor;
 use stream::StreamMessageClient;
 use stream::StreamParams;
-use torch_sys_cuda::nccl::ReduceOp;
-use torch_sys_cuda::nccl::UniqueId;
-use torch_sys2::CudaDevice;
+use backend::AccelDevice;
+use backend::CommId;
+use backend::ReduceOp;
 use torch_sys2::DeviceIndex;
 use torch_sys2::Layout;
 use torch_sys2::ScalarType;
@@ -151,7 +152,7 @@ enum Recording {
     ],
 )]
 pub struct WorkerActor {
-    device: Option<CudaDevice>,
+    device: Option<AccelDevice>,
     streams: HashMap<StreamRef, Arc<ActorHandle<StreamActor>>>,
     /// Maps streams to the device mesh and a map of dim names to the concrete
     /// communicator actor that represents the dimension for that stream.
@@ -235,7 +236,7 @@ impl RemoteSpawn for WorkerActor {
             py.import("monarch.safe_torch").unwrap();
         });
         Ok(Self {
-            device: device_index.map(|i| CudaDevice::new(DeviceIndex(i))),
+            device: device_index.map(|i| AccelDevice::new(DeviceIndex(i))),
             streams: HashMap::new(),
             device_meshes: HashMap::new(),
             world_size,
@@ -299,7 +300,7 @@ impl WorkerMessageHandler for WorkerActor {
     async fn backend_network_init(
         &mut self,
         cx: &hyperactor::Context<Self>,
-        unique_id: UniqueId,
+        unique_id: CommId,
     ) -> Result<()> {
         let device = self
             .device
@@ -320,7 +321,7 @@ impl WorkerMessageHandler for WorkerActor {
             cx,
             cell,
             ReduceOp::Sum,
-            torch_sys_cuda::cuda::Stream::get_current_stream(),
+            backend::Stream::get_current_stream(),
         )
         .await?;
 
@@ -1942,7 +1943,7 @@ mod tests {
             )
             .unwrap();
 
-        let unique_id = UniqueId::new().unwrap();
+        let unique_id = CommId::new().unwrap();
         worker_handle1
             .backend_network_init(&client, unique_id.clone())
             .await

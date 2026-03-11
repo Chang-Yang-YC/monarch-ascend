@@ -14,7 +14,19 @@ from pathlib import Path
 def _local_device_count() -> int:
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         return len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+    if "ASCEND_RT_VISIBLE_DEVICES" in os.environ:
+        return len(os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(","))
+
     dev_path = Path("/dev")
     pattern = re.compile(r"nvidia\d+$")
     nvidia_devices = [dev for dev in dev_path.iterdir() if pattern.match(dev.name)]
-    return len(nvidia_devices)
+    if nvidia_devices:
+        return len(nvidia_devices)
+
+    # NPU devices: /dev/davinci0, /dev/davinci1, ...
+    npu_pattern = re.compile(r"davinci\d+$")
+    npu_devices = [dev for dev in dev_path.iterdir() if npu_pattern.match(dev.name)]
+    if npu_devices:
+        return len(npu_devices)
+
+    return 0

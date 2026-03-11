@@ -14,7 +14,9 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hyperactor = { version = "0.0.0", path = "../hyperactor" }
 hyperactor_config = { version = "0.0.0", path = "../hyperactor_config" }
 rand = { version = "0.9", features = ["small_rng"] }
-rdmaxcel-sys = { path = "../rdmaxcel-sys" }
+rdmaxcel-sys = { path = "../rdmaxcel-sys", optional = true }
+hostname = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }
 regex = "1.12.3"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
@@ -26,5 +28,6 @@ wirevalue = { version = "0.0.0", path = "../wirevalue" }
 timed_test = { version = "0.0.0", path = "../timed_test" }
 
 [features]
-cuda = []
+cuda = ["dep:rdmaxcel-sys"]
+hixl = ["dep:hostname", "dep:libc"]
 default = ["cuda"]
