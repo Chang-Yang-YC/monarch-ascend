@@ -264,6 +264,8 @@ def _initialize_env(worker_point: Point, proc_id: str) -> None:
         num_worker_procs = worker_point.extent.nelements
         process_env = {
             "CUDA_VISIBLE_DEVICES": str(local_rank),
+            "ASCEND_RT_VISIBLE_DEVICES": str(local_rank),
+            "MONARCH_NPU_DEVICE": str(local_rank),
             "NCCL_HOSTID": f"{proc_id}_host_{worker_rank // gpus_per_host}",
             # This is needed to avoid a hard failure in ncclx when we do not
             # have backend topology info (eg. on RE).

@@ -28,6 +28,50 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::raw::c_char;
 
+// ============================================================================
+// Manual FFI declarations for functions not in generated bindings
+// ============================================================================
+
+extern "C" {
+    /// Set the ACL device for the current thread.
+    /// Returns the device ID on success, -2 on ACL error, -3 if ACL not available.
+    pub fn HixlSetAclDevice(device_id: i32) -> i32;
+
+    /// Get the current ACL device for the current thread.
+    /// Returns -1 if no device is set, -3 if ACL not available.
+    pub fn HixlGetAclDevice() -> i32;
+}
+
+/// Set the ACL device for the current thread.
+/// Returns Ok(device_id) on success, Err if ACL not available or failed.
+pub fn set_acl_device(device_id: i32) -> HixlResult<i32> {
+    let result = unsafe { HixlSetAclDevice(device_id) };
+    if result >= 0 {
+        Ok(result)
+    } else if result == -3 {
+        Err(HixlError {
+            status: HIXL_NOT_INITIALIZED,
+            message: "ACL not available".to_string(),
+        })
+    } else {
+        Err(HixlError {
+            status: HIXL_FAILED,
+            message: format!("Failed to set ACL device {}", device_id),
+        })
+    }
+}
+
+/// Get the current ACL device for the current thread.
+/// Returns Some(device_id) if a device is set, None otherwise.
+pub fn get_acl_device() -> Option<i32> {
+    let result = unsafe { HixlGetAclDevice() };
+    if result >= 0 {
+        Some(result)
+    } else {
+        None
+    }
+}
+
 
 /// Safe wrapper result type for HIXL operations.
 pub type HixlResult<T> = Result<T, HixlError>;

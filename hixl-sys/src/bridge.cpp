@@ -17,8 +17,10 @@
 #include <dlfcn.h>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <vector>
+#include <unistd.h>
 
 // Forward-declare hixl types only if the real headers are available.
 // We dlopen libcann_hixl.so at runtime to avoid a hard link-time dependency.
@@ -91,25 +93,50 @@ void HixlDestroy(HixlHandle handle) {
 
 // Ensure ACL runtime is initialized with a device context.
 // HIXL requires the ACL device context to be active.
+//
+// This function respects the device set by torch_npu/torch.npu.set_device()
+// and falls back to MONARCH_NPU_DEVICE or ASCEND_RT_VISIBLE_DEVICES env vars.
 static bool ensure_acl_device() {
 #if ACL_AVAILABLE
-    static bool initialized = false;
+    static thread_local bool initialized = false;
     if (initialized) return true;
 
-    // aclInit is idempotent if already initialized by torch_npu
-    auto ret = aclInit(nullptr);
-    if (ret != 0 && ret != 100002 /* ACL_ERROR_REPEAT_INITIALIZE */) {
-        std::cerr << "[HIXL-SYS] aclInit failed: " << ret << std::endl;
-        return false;
+    // torch_npu already initialized ACL; skip aclInit to avoid state corruption.
+    // We only need to ensure the correct device is set for this thread.
+
+    // First, check if a device is already set (by torch_npu)
+    int32_t current_dev = -1;
+    aclError ret = aclrtGetDevice(&current_dev);
+    if (ret == 0 && current_dev >= 0) {
+        // Device already set by Python/torch_npu
+        std::cerr << "[HIXL-SYS] ensure_acl_device: using existing device " << current_dev
+                  << " (pid=" << getpid() << ")" << std::endl;
+        initialized = true;
+        return true;
     }
 
-    // Try to set device 0 (aclrtSetDevice is also idempotent per thread)
-    ret = aclrtSetDevice(0);
+    // No device set, determine from environment variables
+    int target_dev = 0;
+    const char* npu_dev = getenv("MONARCH_NPU_DEVICE");
+    if (npu_dev) {
+        target_dev = atoi(npu_dev);
+    } else {
+        const char* vis = getenv("ASCEND_RT_VISIBLE_DEVICES");
+        if (vis) {
+            target_dev = atoi(vis);
+        }
+    }
+
+    ret = aclrtSetDevice(target_dev);
     if (ret != 0) {
-        std::cerr << "[HIXL-SYS] aclrtSetDevice(0) failed: " << ret << std::endl;
+        std::cerr << "[HIXL-SYS] aclrtSetDevice(" << target_dev << ") failed: " << ret << std::endl;
         return false;
     }
 
+    int32_t final_dev = -1;
+    aclrtGetDevice(&final_dev);
+    std::cerr << "[HIXL-SYS] ensure_acl_device: using device " << final_dev
+              << " (pid=" << getpid() << ")" << std::endl;
     initialized = true;
     return true;
 #else
@@ -173,14 +200,35 @@ HixlStatus HixlTransferSync(HixlHandle handle, const char *remote,
                              HixlTransferOp op, const HixlTransferOpDesc *descs,
                              size_t n, int32_t timeout) {
     if (!handle || !remote) return HIXL_PARAM_INVALID;
+    if (!ensure_acl_device()) {
+        std::cerr << "[HIXL-SYS] TransferSync: ACL device setup failed" << std::endl;
+    }
+
+    // Debug output
+    std::cerr << "[HIXL-SYS] TransferSync handle=" << handle
+              << " remote='" << remote << "'"
+              << " op=" << (int)op << " n=" << n
+              << " timeout=" << timeout << " pid=" << getpid() << std::endl;
+    for (size_t i = 0; i < n; ++i) {
+        std::cerr << "[HIXL-SYS]   [" << i << "] local=" << (void*)descs[i].local_addr
+                  << " remote=" << (void*)descs[i].remote_addr
+                  << " len=" << descs[i].len << std::endl;
+    }
+    std::cerr.flush();
+
     std::vector<hixl::TransferOpDesc> v(n);
     for (size_t i = 0; i < n; ++i) {
         v[i].local_addr = descs[i].local_addr;
         v[i].remote_addr = descs[i].remote_addr;
         v[i].len = descs[i].len;
     }
-    return static_cast<hixl::Hixl *>(handle)->TransferSync(
+    auto s = static_cast<hixl::Hixl *>(handle)->TransferSync(
         hixl::AscendString(remote), to_transfer_op(op), v, timeout);
+    
+    const char* err = aclGetRecentErrMsg();
+    std::cerr << "[HIXL-SYS] TransferSync result=" << s 
+              << " err=" << (err ? err : "none") << std::endl;
+    return s;
 }
 
 HixlStatus HixlTransferAsync(HixlHandle handle, const char *remote,
@@ -249,6 +297,30 @@ const char *HixlGetStatusString(HixlStatus status) {
     }
 }
 
+int32_t HixlSetAclDevice(int32_t device_id) {
+#if ACL_AVAILABLE
+    auto ret = aclrtSetDevice(device_id);
+    if (ret != 0) {
+        std::cerr << "[HIXL-SYS] HixlSetAclDevice(" << device_id << ") failed: " << ret << std::endl;
+        return -2;
+    }
+    std::cerr << "[HIXL-SYS] HixlSetAclDevice: set device " << device_id << std::endl;
+    return device_id;
+#else
+    return -3;
+#endif
+}
+
+int32_t HixlGetAclDevice(void) {
+#if ACL_AVAILABLE
+    int32_t dev = -1;
+    aclrtGetDevice(&dev);
+    return dev;
+#else
+    return -3;
+#endif
+}
+
 } // extern "C"
 
 #else // !HIXL_HEADERS_AVAILABLE
@@ -288,6 +360,9 @@ const char *HixlGetStatusString(HixlStatus status) {
         default:                      return "HIXL_UNKNOWN_ERROR";
     }
 }
+
+int32_t HixlSetAclDevice(int32_t) { return -3; }
+int32_t HixlGetAclDevice(void) { return -3; }
 
 } // extern "C"
 

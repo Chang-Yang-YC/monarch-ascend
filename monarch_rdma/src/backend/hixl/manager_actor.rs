@@ -141,9 +141,11 @@ fn init_process_hixl(engine_id: String) -> Result<()> {
     let hixl = hixl_sys::Hixl::new()
         .map_err(|e| anyhow::anyhow!("Failed to create HIXL instance: {}", e))?;
     
-    // Initialize with listening port (port > 0 enables server mode)
-    tracing::info!("HIXL: initializing with engine_id={}", engine_id);
-    hixl.initialize(&engine_id, &[])
+    // Initialize with BufferPool option (required by HIXL for proper memory management)
+    // This matches the HIXL native examples and ref-monarch implementation
+    let options = [("BufferPool", "0:0")];
+    tracing::info!("HIXL: initializing with engine_id={} options={:?}", engine_id, options);
+    hixl.initialize(&engine_id, &options)
         .map_err(|e| anyhow::anyhow!("HIXL initialize failed: {}", e))?;
     tracing::info!("HIXL: engine initialized successfully, server listening on {}", engine_id);
 

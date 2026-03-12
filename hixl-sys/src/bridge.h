@@ -141,6 +141,18 @@ HixlStatus HixlGetNotifies(HixlHandle handle,
 
 const char *HixlGetStatusString(HixlStatus status);
 
+// ============================================================================
+// ACL Device Management (for device context synchronization)
+// ============================================================================
+
+/// Set the ACL device for the current thread.
+/// Returns the device ID on success, -2 on ACL error, -3 if ACL not available.
+int32_t HixlSetAclDevice(int32_t device_id);
+
+/// Get the current ACL device for the current thread.
+/// Returns -1 if no device is set, -3 if ACL not available.
+int32_t HixlGetAclDevice(void);
+
 #ifdef __cplusplus
 }
 #endif
