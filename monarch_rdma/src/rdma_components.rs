@@ -22,12 +22,13 @@ use typeuri::Named;
 
 use crate::RdmaLocalMemory;
 use crate::RdmaManagerActor;
-use crate::RdmaOp;
-use crate::RdmaOpType;
 use crate::ReleaseBufferClient;
-#[cfg(feature = "hixl")]
-use crate::EnsurePeerConnectedClient;
 use crate::backend::RdmaBackendContext;
+
+#[cfg(not(feature = "hixl"))]
+use crate::RdmaOp;
+#[cfg(not(feature = "hixl"))]
+use crate::RdmaOpType;
 
 #[cfg(not(feature = "hixl"))]
 use crate::backend::RdmaBackend;
@@ -37,6 +38,9 @@ use crate::backend::ibverbs::IbvBuffer;
 use crate::backend::ibverbs::manager_actor::IbvManagerActor;
 #[cfg(not(feature = "hixl"))]
 use crate::backend::ibverbs::manager_actor::IbvManagerMessageClient;
+
+#[cfg(feature = "hixl")]
+use crate::backend::hixl::HixlBuffer;
 
 /// Lightweight handle representing a registered RDMA buffer.
 #[derive(Debug, Named, Clone, Serialize, Deserialize)]
@@ -49,7 +53,10 @@ pub struct RdmaRemoteBuffer {
 wirevalue::register_type!(RdmaRemoteBuffer);
 
 impl RdmaRemoteBuffer {
-    /// Push data from local memory into this remote buffer (local->remote).
+    // ----------------------------------------------------------------
+    // GPU: ibverbs path
+    // ----------------------------------------------------------------
+
     #[cfg(not(feature = "hixl"))]
     pub async fn write_from_local(
         &self,
@@ -72,24 +79,6 @@ impl RdmaRemoteBuffer {
         Ok(true)
     }
 
-    /// Push data from local memory into this remote buffer (external backend path).
-    /// The actual transfer is handled by the Python transport plugin; this Rust
-    /// path is kept as a fallback but returns an error directing callers to
-    /// use the Python ``write_from`` path instead.
-    #[cfg(feature = "hixl")]
-    pub async fn write_from_local(
-        &self,
-        _client: &(impl context::Actor + Send + Sync),
-        _local: Arc<dyn RdmaLocalMemory>,
-        _timeout: u64,
-    ) -> Result<bool, anyhow::Error> {
-        Err(anyhow::anyhow!(
-            "External transport transfers should be handled by the Python transport plugin, \
-             not the Rust path. Check that rdma.py routes through external_backend_info()."
-        ))
-    }
-
-    /// Pull data from this remote buffer into local memory (remote->local).
     #[cfg(not(feature = "hixl"))]
     pub async fn read_into_local(
         &self,
@@ -112,19 +101,110 @@ impl RdmaRemoteBuffer {
         Ok(true)
     }
 
-    /// Pull data from this remote buffer into local memory (external backend path).
+    // ----------------------------------------------------------------
+    // NPU: HIXL path (Plan B — transfers via hixl-sys)
+    // ----------------------------------------------------------------
+
+    #[cfg(feature = "hixl")]
+    pub async fn write_from_local(
+        &self,
+        client: &(impl context::Actor + Send + Sync),
+        local: Arc<dyn RdmaLocalMemory>,
+        _timeout: u64,
+    ) -> Result<bool, anyhow::Error> {
+        let hixl_buf = self.resolve_hixl()?;
+
+        crate::backend::hixl::manager_actor::register_mem_if_needed(
+            local.addr(),
+            local.size(),
+        )?;
+
+        crate::backend::hixl::manager_actor::ensure_connected(
+            client,
+            &self.owner,
+            &hixl_buf.engine_id,
+        )
+        .await?;
+
+        let state = crate::backend::hixl::manager_actor::get_hixl_state()?;
+        state
+            .engine
+            .transfer_write(
+                &hixl_buf.engine_id,
+                local.addr(),
+                hixl_buf.addr,
+                local.size(),
+            )
+            .map_err(|ret| {
+                anyhow::anyhow!(
+                    "hixl_transfer_write failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                    local.addr(),
+                    hixl_buf.addr,
+                    hixl_buf.engine_id,
+                    local.size(),
+                    ret,
+                )
+            })?;
+
+        Ok(true)
+    }
+
     #[cfg(feature = "hixl")]
     pub async fn read_into_local(
         &self,
-        _client: &(impl context::Actor + Send + Sync),
-        _local: Arc<dyn RdmaLocalMemory>,
+        client: &(impl context::Actor + Send + Sync),
+        local: Arc<dyn RdmaLocalMemory>,
         _timeout: u64,
     ) -> Result<bool, anyhow::Error> {
-        Err(anyhow::anyhow!(
-            "External transport transfers should be handled by the Python transport plugin, \
-             not the Rust path. Check that rdma.py routes through external_backend_info()."
-        ))
+        let hixl_buf = self.resolve_hixl()?;
+
+        crate::backend::hixl::manager_actor::register_mem_if_needed(
+            local.addr(),
+            local.size(),
+        )?;
+
+        crate::backend::hixl::manager_actor::ensure_connected(
+            client,
+            &self.owner,
+            &hixl_buf.engine_id,
+        )
+        .await?;
+
+        let state = crate::backend::hixl::manager_actor::get_hixl_state()?;
+        for attempt in 0..3u32 {
+            match state.engine.transfer_read(
+                &hixl_buf.engine_id,
+                local.addr(),
+                hixl_buf.addr,
+                local.size(),
+            ) {
+                Ok(()) => return Ok(true),
+                Err(ret) if attempt < 2 => {
+                    tracing::warn!(
+                        "[hixl] transfer_read attempt {} failed (ret={}), retrying in 1s…",
+                        attempt,
+                        ret,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(ret) => {
+                    return Err(anyhow::anyhow!(
+                        "hixl_transfer_read failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                        local.addr(),
+                        hixl_buf.addr,
+                        hixl_buf.engine_id,
+                        local.size(),
+                        ret,
+                    ));
+                }
+            }
+        }
+        unreachable!()
     }
+
+    // ----------------------------------------------------------------
+    // Common
+    // ----------------------------------------------------------------
 
     /// Drop the buffer and release remote handles.
     pub async fn drop_buffer(&self, client: &impl context::Actor) -> Result<(), anyhow::Error> {
@@ -150,7 +230,7 @@ impl RdmaRemoteBuffer {
         Ok((
             remote_ibv_mgr.clone(),
             remote_ibv_buf
-                .get_or_try_init(async || {
+                .get_or_try_init(async {
                     remote_ibv_mgr
                         .request_buffer(client, self.id)
                         .await?
@@ -159,6 +239,20 @@ impl RdmaRemoteBuffer {
                 .await
                 .cloned()?,
         ))
+    }
+
+    /// Extract the [`HixlBuffer`] from the backend context (NPU path).
+    #[cfg(feature = "hixl")]
+    pub fn resolve_hixl(&self) -> Result<HixlBuffer, anyhow::Error> {
+        self.backends
+            .first()
+            .map(|ctx| {
+                let RdmaBackendContext::Hixl(buf) = ctx;
+                buf.clone()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("HIXL backend not found for buffer: {:?}", self)
+            })
     }
 }
 
@@ -231,6 +325,4 @@ pub fn register_segment_scanner(scanner: SegmentScannerFn) {
     unsafe { rdmaxcel_sys::rdmaxcel_register_segment_scanner(scanner) }
 }
 #[cfg(feature = "hixl")]
-pub fn register_segment_scanner(_scanner: SegmentScannerFn) {
-    // No-op for HIXL backend: NPU memory registration is handled by HIXL directly.
-}
+pub fn register_segment_scanner(_scanner: SegmentScannerFn) {}

@@ -323,6 +323,7 @@ impl RdmaManagerActor {
 #[derive(Debug, Named, Clone, Serialize, Deserialize, Default)]
 pub struct HixlConfig {
     pub engine_id: Option<String>,
+    pub device_id: Option<i32>,
 }
 
 #[cfg(feature = "hixl")]
@@ -354,10 +355,9 @@ impl RemoteSpawn for RdmaManagerActor {
 
     async fn new(params: Self::Params, _environment: Flattrs) -> Result<Self, anyhow::Error> {
         let config = params.unwrap_or_default();
-        let engine_id = config
-            .engine_id
-            .unwrap_or_default();
-        let hixl_actor = HixlManagerActor::new(engine_id);
+        let engine_id = config.engine_id.unwrap_or_default();
+        let device_id = config.device_id.unwrap_or(-1);
+        let hixl_actor = HixlManagerActor::new(engine_id, device_id);
         let hixl = RdmaBackendActor::Created(hixl_actor);
         Ok(Self {
             next_remote_buf_id: 0,
@@ -406,8 +406,8 @@ impl EnsurePeerConnectedHandler for RdmaManagerActor {
         _cx: &Context<Self>,
         peer_engine_id: String,
     ) -> Result<(), anyhow::Error> {
-        tracing::warn!("RdmaManager: ensure_peer_connected to {}", peer_engine_id);
-        crate::backend::hixl::manager_actor::hixl_connect_peer(&peer_engine_id)?;
+        tracing::info!("RdmaManager: ensure_peer_connected to {}", peer_engine_id);
+        crate::backend::hixl::manager_actor::do_connect(&peer_engine_id)?;
         Ok(())
     }
 }
@@ -429,20 +429,21 @@ impl RdmaManagerMessageHandler for RdmaManagerActor {
         tracing::warn!("RdmaManager: request_buffer id={} addr={:#x} size={}", remote_buf_id, addr, size);
         self.buffers.insert(remote_buf_id, local);
 
-        tracing::warn!("RdmaManager: sending to HixlManagerActor...");
-        let hixl_buf = self.hixl.handle().request_buffer(cx, remote_buf_id, addr, size).await?
-            .ok_or_else(|| anyhow::anyhow!("HIXL request_buffer returned None for id {}", remote_buf_id))?;
-        tracing::warn!("RdmaManager: got HixlBuffer: {:?}", hixl_buf);
+        let hixl_buf = self
+            .hixl
+            .handle()
+            .request_buffer(cx, remote_buf_id, addr, size)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("HIXL request_buffer returned None for id {}", remote_buf_id)
+            })?;
+        tracing::debug!("RdmaManager: got HixlBuffer: {:?}", hixl_buf);
 
         Ok(RdmaRemoteBuffer {
             id: remote_buf_id,
             size,
             owner: cx.bind().clone(),
-            backends: vec![RdmaBackendContext::External {
-                engine_id: hixl_buf.engine_id,
-                addr: hixl_buf.addr,
-                size: hixl_buf.size,
-            }],
+            backends: vec![RdmaBackendContext::Hixl(hixl_buf)],
         })
     }
 

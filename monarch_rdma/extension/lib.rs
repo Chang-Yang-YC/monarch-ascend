@@ -280,17 +280,14 @@ impl PyRdmaBuffer {
         self.buffer.size
     }
 
-    /// Return external transport backend info ``(engine_id, addr)`` if present,
-    /// or ``None`` when the buffer uses a native Rust-managed backend (ibverbs).
-    ///
-    /// This is the generic hook that the Python transport registry uses to
-    /// route transfers to the appropriate plugin (e.g., HiXL, or any future
-    /// backend). Monarch core never needs to know *which* backend it is.
+    /// Return HIXL backend info ``(engine_id, addr)`` if present,
+    /// or ``None`` when the buffer uses a native ibverbs backend.
     fn external_backend_info(&self) -> Option<(String, usize)> {
         for ctx in &self.buffer.backends {
             match ctx {
-                monarch_rdma::backend::RdmaBackendContext::External { engine_id, addr, .. } => {
-                    return Some((engine_id.clone(), *addr));
+                #[cfg(feature = "hixl")]
+                monarch_rdma::backend::RdmaBackendContext::Hixl(buf) => {
+                    return Some((buf.engine_id.clone(), buf.addr));
                 }
                 #[allow(unreachable_patterns)]
                 _ => {}
@@ -304,6 +301,36 @@ impl PyRdmaBuffer {
     fn local_external_engine_id() -> Option<String> {
         std::env::var("MONARCH_PYTHON_HIXL_ENGINE_ID").ok()
             .or_else(|| std::env::var("MONARCH_TRANSPORT_ENGINE_ID").ok())
+    }
+
+    /// Return (engine_ptr, engine_id) of the Rust-managed HiXL engine, for diagnostics.
+    #[staticmethod]
+    fn hixl_engine_diag() -> Option<(usize, String)> {
+        #[cfg(feature = "hixl")]
+        {
+            monarch_rdma::backend::hixl::manager_actor::get_hixl_state().ok().map(|s| {
+                (s.engine.ptr() as usize, s.engine_id.clone())
+            })
+        }
+        #[cfg(not(feature = "hixl"))]
+        { None }
+    }
+
+    /// Store a pre-initialised HiXL engine pointer (from Python ctypes) into
+    /// the process-global Rust state, so that ``HixlManagerActor`` picks it up
+    /// instead of calling ``hixl_init_engine`` itself.
+    #[staticmethod]
+    fn set_hixl_engine(ptr: usize, engine_id: String) -> PyResult<()> {
+        #[cfg(feature = "hixl")]
+        {
+            monarch_rdma::backend::hixl::manager_actor::set_hixl_state_from_raw(ptr, engine_id)
+                .map_err(|e| PyException::new_err(e.to_string()))
+        }
+        #[cfg(not(feature = "hixl"))]
+        {
+            let _ = (ptr, engine_id);
+            Err(PyException::new_err("HiXL feature not enabled"))
+        }
     }
 
     fn __reduce__(&self) -> PyResult<(Py<PyAny>, Py<PyAny>)> {

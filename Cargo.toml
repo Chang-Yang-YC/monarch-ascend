@@ -22,6 +22,7 @@ members = [
     "monarch_messages",
     "monarch_perfetto_trace",
     "monarch_rdma",
+    "hixl-sys",
     "monarch_tensor_worker",
     "monarch_types",
     "nccl-sys",

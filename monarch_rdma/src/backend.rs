@@ -9,9 +9,7 @@
 //! RDMA backend implementations.
 //!
 //! On GPU: ibverbs backend (rdmaxcel) for InfiniBand/RoCE.
-//! External backends (e.g., HiXL for Ascend NPU) are represented by the
-//! [`RdmaBackendContext::External`] variant which carries opaque metadata.
-//! The actual transport work is done by Python-side transport plugins.
+//! On NPU: HIXL backend for Ascend RDMA/RoCE/HCCS.
 
 #[cfg(not(feature = "hixl"))]
 pub mod ibverbs;
@@ -34,9 +32,7 @@ use crate::RdmaTransportLevel;
 /// Backend-specific context for a remote buffer.
 ///
 /// - **Ibverbs**: native Rust-managed QP/MR transport (GPU).
-/// - **External**: opaque metadata for a Python-managed transport plugin
-///   (e.g., HiXL, or any future backend). Monarch core does not import
-///   or link against the underlying library.
+/// - **Hixl**: Rust-managed HIXL transport (Ascend NPU).
 #[derive(Debug, Clone)]
 pub enum RdmaBackendContext {
     #[cfg(not(feature = "hixl"))]
@@ -44,11 +40,8 @@ pub enum RdmaBackendContext {
         hyperactor::ActorRef<ibverbs::manager_actor::IbvManagerActor>,
         Arc<tokio::sync::OnceCell<ibverbs::IbvBuffer>>,
     ),
-    External {
-        engine_id: String,
-        addr: usize,
-        size: usize,
-    },
+    #[cfg(feature = "hixl")]
+    Hixl(hixl::HixlBuffer),
 }
 
 impl Serialize for RdmaBackendContext {
@@ -58,17 +51,9 @@ impl Serialize for RdmaBackendContext {
             RdmaBackendContext::Ibverbs(actor_ref, _) => {
                 serializer.serialize_newtype_variant("RdmaBackendContext", 0, "Ibverbs", actor_ref)
             }
-            RdmaBackendContext::External { engine_id, addr, size } => {
-                #[derive(Serialize)]
-                struct ExtBuf<'a> {
-                    engine_id: &'a str,
-                    addr: usize,
-                    size: usize,
-                }
-                serializer.serialize_newtype_variant(
-                    "RdmaBackendContext", 1, "External",
-                    &ExtBuf { engine_id, addr: *addr, size: *size },
-                )
+            #[cfg(feature = "hixl")]
+            RdmaBackendContext::Hixl(buf) => {
+                serializer.serialize_newtype_variant("RdmaBackendContext", 1, "Hixl", buf)
             }
         }
     }
@@ -77,18 +62,12 @@ impl Serialize for RdmaBackendContext {
 impl<'de> Deserialize<'de> for RdmaBackendContext {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        struct ExtBuf {
-            engine_id: String,
-            addr: usize,
-            size: usize,
-        }
-
-        #[derive(Deserialize)]
         #[serde(rename = "RdmaBackendContext")]
         enum Repr {
             #[cfg(not(feature = "hixl"))]
             Ibverbs(hyperactor::ActorRef<ibverbs::manager_actor::IbvManagerActor>),
-            External(ExtBuf),
+            #[cfg(feature = "hixl")]
+            Hixl(hixl::HixlBuffer),
         }
 
         match Repr::deserialize(deserializer)? {
@@ -97,23 +76,13 @@ impl<'de> Deserialize<'de> for RdmaBackendContext {
                 actor_ref,
                 Arc::new(tokio::sync::OnceCell::new()),
             )),
-            Repr::External(buf) => Ok(RdmaBackendContext::External {
-                engine_id: buf.engine_id,
-                addr: buf.addr,
-                size: buf.size,
-            }),
+            #[cfg(feature = "hixl")]
+            Repr::Hixl(buf) => Ok(RdmaBackendContext::Hixl(buf)),
         }
     }
 }
 
 /// Backend for executing RDMA operations over a specific transport.
-///
-/// Each backend manages the transport-specific details of connection
-/// management and data movement.
-///
-/// Implementations:
-/// - [`ibverbs::IbvManagerActor`] -- ibverbs NIC transport (GPU)
-/// - [`hixl::manager_actor::HixlManagerActor`] -- HIXL transport (NPU)
 #[async_trait]
 pub trait RdmaBackend: Send + Debug {
     type TransportInfo;

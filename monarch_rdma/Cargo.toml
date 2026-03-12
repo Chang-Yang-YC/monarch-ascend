@@ -15,6 +15,7 @@ hyperactor = { version = "0.0.0", path = "../hyperactor" }
 hyperactor_config = { version = "0.0.0", path = "../hyperactor_config" }
 rand = { version = "0.9", features = ["small_rng"] }
 rdmaxcel-sys = { path = "../rdmaxcel-sys", optional = true }
+hixl-sys = { path = "../hixl-sys", optional = true }
 hostname = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 regex = "1.12.3"
@@ -29,5 +30,5 @@ timed_test = { version = "0.0.0", path = "../timed_test" }
 
 [features]
 cuda = ["dep:rdmaxcel-sys"]
-hixl = ["dep:hostname", "dep:libc"]
+hixl = ["dep:hixl-sys", "dep:hostname", "dep:libc"]
 default = ["cuda"]
