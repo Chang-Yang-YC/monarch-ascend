@@ -152,33 +152,6 @@ def _ensure_registered(addr: int, size: int) -> None:
 # Public transfer functions (kept for backward compat and direct use)
 # ---------------------------------------------------------------------------
 
-def init_for_rust() -> str:
-    """Initialise the HiXL engine via ctypes and pass the pointer to Rust.
-
-    Call this from an actor process (after ``torch.npu.set_device()``)
-    **before** any ``RDMABuffer`` / ``XDMABuffer`` is created so that the
-    ``HixlManagerActor`` picks up the ctypes-created engine instead of
-    calling ``hixl_init_engine`` through the Rust FFI path (which may fail
-    on certain platforms due to ACL context / thread-affinity issues).
-
-    Returns the engine_id string.
-    """
-    with _lock:
-        _ensure_init()
-        assert _ctx is not None and _engine_id is not None
-        try:
-            from monarch._rust_bindings.rdma import _RdmaBuffer
-            _RdmaBuffer.set_hixl_engine(_ctx, _engine_id)
-            logger.warning(
-                "HIXL: passed ctypes engine to Rust: eid=%s ptr=%s",
-                _engine_id,
-                hex(_ctx),
-            )
-        except Exception as exc:
-            logger.warning("HIXL: set_hixl_engine failed (non-fatal): %s", exc)
-        return _engine_id
-
-
 def get_engine_id() -> str:
     with _lock:
         _ensure_init()

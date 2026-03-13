@@ -26,7 +26,7 @@ Quick start::
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -49,25 +49,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _rdma_manager: Optional[_RdmaManager] = None
-_hixl_engine_inited: bool = False
-
-
-def _ensure_hixl_engine_for_rust() -> None:
-    """Initialise the HiXL engine via ctypes and pass the pointer to Rust.
-
-    Must be called before ``_ensure_init_rdma_manager()`` so that the
-    Rust ``HixlManagerActor`` finds the engine already present and skips
-    its own (potentially broken) Rust-FFI initialisation path.
-    """
-    global _hixl_engine_inited
-    if _hixl_engine_inited:
-        return
-    _hixl_engine_inited = True
-    try:
-        from monarch._src.rdma.hixl_transfer import init_for_rust
-        init_for_rust()
-    except Exception as exc:
-        logger.warning("xdma: HiXL pre-init failed (non-fatal): %s", exc)
 
 
 def _ensure_init_rdma_manager():
@@ -90,6 +71,51 @@ def context():
 
 
 # ---------------------------------------------------------------------------
+# 2 MB aligned allocation helper (required for HCCS transport)
+# ---------------------------------------------------------------------------
+
+HCCS_ALIGNMENT = 2 * 1024 * 1024  # 2 MB
+
+
+def alloc_aligned_tensor(
+    shape,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: str = "npu",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Allocate a 2 MB-aligned device tensor for HCCS transfers.
+
+    HCCS (Huawei Chip-to-Chip-Set intra-supernode interconnect) requires
+    ``data_ptr % 2MB == 0``.  This function over-allocates by 2 MB and
+    returns an aligned view.
+
+    Returns:
+        ``(aligned_tensor, backing_storage)`` — keep *backing_storage*
+        alive for the lifetime of *aligned_tensor* to prevent GC.
+    """
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    numel = 1
+    if isinstance(shape, int):
+        numel = shape
+    else:
+        for s in shape:
+            numel *= s
+    nbytes = numel * elem_size
+
+    raw = torch.empty(nbytes + HCCS_ALIGNMENT, dtype=torch.uint8, device=device)
+    raw_ptr = raw.data_ptr()
+    offset = (HCCS_ALIGNMENT - (raw_ptr % HCCS_ALIGNMENT)) % HCCS_ALIGNMENT
+    aligned_flat = raw.narrow(0, offset, nbytes).view(dtype)
+
+    aligned = aligned_flat.view(shape) if not isinstance(shape, int) else aligned_flat
+    assert aligned.data_ptr() % HCCS_ALIGNMENT == 0, (
+        f"alignment failed: {hex(aligned.data_ptr())} % {HCCS_ALIGNMENT} "
+        f"= {aligned.data_ptr() % HCCS_ALIGNMENT}"
+    )
+    return aligned, raw
+
+
+# ---------------------------------------------------------------------------
 # XDMABuffer — the NPU equivalent of RDMABuffer
 # ---------------------------------------------------------------------------
 
@@ -104,7 +130,6 @@ class XDMABuffer:
     """
 
     def __init__(self, data: "torch.Tensor | memoryview") -> None:
-        _ensure_hixl_engine_for_rust()
         _ensure_init_rdma_manager().block_on()
 
         handle = _make_local_memory_handle(data)
@@ -130,7 +155,6 @@ class XDMABuffer:
 
         Connection establishment happens automatically on first use.
         """
-        _ensure_hixl_engine_for_rust()
         handle = _make_local_memory_handle(dst)
         if self.size() > handle.size:
             raise ValueError(
@@ -155,7 +179,6 @@ class XDMABuffer:
         timeout: int = 3,
     ) -> "Future[None]":
         """Push data from *src* into the remote buffer."""
-        _ensure_hixl_engine_for_rust()
         handle = _make_local_memory_handle(src)
         if handle.size > self.size():
             raise ValueError(

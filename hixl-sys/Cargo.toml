@@ -5,5 +5,10 @@ authors = ["Meta"]
 edition = "2024"
 license = "BSD-3-Clause"
 build = "build.rs"
+links = "hixl_shim"
 
 [dependencies]
+
+[build-dependencies]
+cc = "1.0"
+build_utils = { path = "../build_utils" }

@@ -308,29 +308,12 @@ impl PyRdmaBuffer {
     fn hixl_engine_diag() -> Option<(usize, String)> {
         #[cfg(feature = "hixl")]
         {
-            monarch_rdma::backend::hixl::manager_actor::get_hixl_state().ok().map(|s| {
-                (s.engine.ptr() as usize, s.engine_id.clone())
-            })
+            monarch_rdma::backend::hixl::manager_actor::with_state(|s| {
+                Ok((s.engine.ptr() as usize, s.engine_id.clone()))
+            }).ok()
         }
         #[cfg(not(feature = "hixl"))]
         { None }
-    }
-
-    /// Store a pre-initialised HiXL engine pointer (from Python ctypes) into
-    /// the process-global Rust state, so that ``HixlManagerActor`` picks it up
-    /// instead of calling ``hixl_init_engine`` itself.
-    #[staticmethod]
-    fn set_hixl_engine(ptr: usize, engine_id: String) -> PyResult<()> {
-        #[cfg(feature = "hixl")]
-        {
-            monarch_rdma::backend::hixl::manager_actor::set_hixl_state_from_raw(ptr, engine_id)
-                .map_err(|e| PyException::new_err(e.to_string()))
-        }
-        #[cfg(not(feature = "hixl"))]
-        {
-            let _ = (ptr, engine_id);
-            Err(PyException::new_err("HiXL feature not enabled"))
-        }
     }
 
     fn __reduce__(&self) -> PyResult<(Py<PyAny>, Py<PyAny>)> {

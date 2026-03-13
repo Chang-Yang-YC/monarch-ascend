@@ -328,21 +328,43 @@ pub struct HixlConfig {
 
 #[cfg(feature = "hixl")]
 pub(crate) fn local_ip_for_hixl() -> String {
-    // For intra-node HIXL, use loopback by default.
-    // Set MONARCH_HIXL_USE_REAL_IP=1 for inter-node communication.
-    if std::env::var("MONARCH_HIXL_USE_REAL_IP").is_ok() {
-        if let Ok(hostname) = hostname::get() {
-            if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
-                &format!("{}:0", hostname.to_string_lossy()),
-            ) {
-                for addr in addrs {
-                    if addr.is_ipv4() && !addr.ip().is_loopback() {
-                        return addr.ip().to_string();
-                    }
+    // HCCS requires the real machine IP for intra-supernode transport.
+    // Only fall back to loopback if explicitly requested or if real IP
+    // resolution fails.
+    if std::env::var("MONARCH_HIXL_USE_LOOPBACK").is_ok() {
+        return "127.0.0.1".to_string();
+    }
+
+    if let Ok(hostname) = hostname::get() {
+        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
+            &format!("{}:0", hostname.to_string_lossy()),
+        ) {
+            for addr in addrs {
+                if addr.is_ipv4() && !addr.ip().is_loopback() {
+                    return addr.ip().to_string();
                 }
             }
         }
     }
+
+    // Last resort: try common network interface names
+    if let Ok(output) = std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+    {
+        if let Ok(ips) = std::str::from_utf8(&output.stdout) {
+            if let Some(ip) = ips.split_whitespace().next() {
+                if !ip.starts_with("127.") {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
+
+    tracing::warn!(
+        "[hixl] could not resolve real machine IP, falling back to 127.0.0.1 — \
+         HCCS may not work"
+    );
     "127.0.0.1".to_string()
 }
 #[cfg(feature = "hixl")]

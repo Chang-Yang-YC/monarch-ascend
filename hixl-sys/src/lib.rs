@@ -2,6 +2,10 @@
 //
 // The shim wraps the HiXL C++ API behind a flat C interface,
 // mirroring the role that rdmaxcel-sys plays for ibverbs.
+//
+// All HiXL calls are made directly on the caller's thread after
+// restoring the ACL context via aclrtSetCurrentContext.  No internal
+// worker thread serialisation — callers may invoke from any thread.
 
 #![allow(non_camel_case_types)]
 
@@ -16,11 +20,15 @@ unsafe extern "C" {
 
     /// Establish a connection to a remote engine.
     /// Returns 0 on success.
-    pub fn hixl_connect(ctx: *mut c_void, remote_engine_id: *const c_char) -> c_int;
+    pub fn hixl_connect(ctx: *mut c_void, remote_engine_id: *const c_char, timeout_ms: c_int) -> c_int;
 
     /// Register a device memory region for RDMA access.
     /// Returns 0 on success.
     pub fn hixl_register_mem(ctx: *mut c_void, addr: usize, size: usize) -> c_int;
+
+    /// Deregister a previously registered memory region.
+    /// Returns 0 on success, -1 if the address was not registered.
+    pub fn hixl_deregister_mem(ctx: *mut c_void, addr: usize) -> c_int;
 
     /// Single-sided READ: pull remote data into local buffer.
     /// Returns 0 on success.
@@ -30,6 +38,7 @@ unsafe extern "C" {
         local_addr: usize,
         remote_addr: usize,
         len: usize,
+        timeout_ms: c_int,
     ) -> c_int;
 
     /// Single-sided WRITE: push local data into remote buffer.
@@ -40,19 +49,29 @@ unsafe extern "C" {
         local_addr: usize,
         remote_addr: usize,
         len: usize,
+        timeout_ms: c_int,
     ) -> c_int;
+
+    /// Return the ACL context saved during engine init.
+    pub fn hixl_get_acl_context(ctx: *mut c_void) -> usize;
+
+    /// Probe whether HCCS IPC memory export is supported on the given device.
+    /// Returns 0 if supported, non-zero otherwise.
+    /// Does NOT require an existing HixlEngine — can be called before init.
+    pub fn hixl_probe_hccs(dev: c_int) -> c_int;
 
     /// Finalize and release engine resources.
     pub fn hixl_cleanup(ctx: *mut c_void);
 }
 
 /// Wrapper around the raw HiXL context pointer.
-/// Implements Send + Sync because the underlying C library
-/// serializes access through its own internal locks, and we
-/// guarantee single-threaded use via the actor model.
+/// Send + Sync because the C shim restores ACL context before each
+/// operation, making it safe to call from any thread.
 #[derive(Debug)]
 pub struct HixlEngine {
     ptr: *mut c_void,
+    dev: i32,
+    acl_ctx: usize,
 }
 
 unsafe impl Send for HixlEngine {}
@@ -68,28 +87,36 @@ impl HixlEngine {
                 "hixl_init_engine failed for dev={dev} engine_id={engine_id}"
             ))
         } else {
-            Ok(Self { ptr })
+            let acl_ctx = unsafe { hixl_get_acl_context(ptr) };
+            Ok(Self { ptr, dev, acl_ctx })
         }
-    }
-
-    /// Wrap a pre-existing engine pointer (created externally, e.g. from Python ctypes).
-    /// SAFETY: caller must ensure `ptr` is a valid HixlTestCtx* from hixl_init_engine.
-    pub unsafe fn from_raw(ptr: *mut c_void) -> Self {
-        Self { ptr }
     }
 
     pub fn ptr(&self) -> *mut c_void {
         self.ptr
     }
 
-    pub fn connect(&self, remote_engine_id: &str) -> Result<(), i32> {
+    pub fn dev(&self) -> i32 {
+        self.dev
+    }
+
+    pub fn acl_ctx(&self) -> usize {
+        self.acl_ctx
+    }
+
+    pub fn connect(&self, remote_engine_id: &str, timeout_ms: i32) -> Result<(), i32> {
         let c_eid = std::ffi::CString::new(remote_engine_id).unwrap();
-        let ret = unsafe { hixl_connect(self.ptr, c_eid.as_ptr()) };
+        let ret = unsafe { hixl_connect(self.ptr, c_eid.as_ptr(), timeout_ms) };
         if ret == 0 { Ok(()) } else { Err(ret) }
     }
 
     pub fn register_mem(&self, addr: usize, size: usize) -> Result<(), i32> {
         let ret = unsafe { hixl_register_mem(self.ptr, addr, size) };
+        if ret == 0 { Ok(()) } else { Err(ret) }
+    }
+
+    pub fn deregister_mem(&self, addr: usize) -> Result<(), i32> {
+        let ret = unsafe { hixl_deregister_mem(self.ptr, addr) };
         if ret == 0 { Ok(()) } else { Err(ret) }
     }
 
@@ -99,10 +126,11 @@ impl HixlEngine {
         local_addr: usize,
         remote_addr: usize,
         len: usize,
+        timeout_ms: i32,
     ) -> Result<(), i32> {
         let c_eid = std::ffi::CString::new(remote_engine_id).unwrap();
         let ret = unsafe {
-            hixl_transfer_read(self.ptr, c_eid.as_ptr(), local_addr, remote_addr, len)
+            hixl_transfer_read(self.ptr, c_eid.as_ptr(), local_addr, remote_addr, len, timeout_ms)
         };
         if ret == 0 { Ok(()) } else { Err(ret) }
     }
@@ -113,10 +141,11 @@ impl HixlEngine {
         local_addr: usize,
         remote_addr: usize,
         len: usize,
+        timeout_ms: i32,
     ) -> Result<(), i32> {
         let c_eid = std::ffi::CString::new(remote_engine_id).unwrap();
         let ret = unsafe {
-            hixl_transfer_write(self.ptr, c_eid.as_ptr(), local_addr, remote_addr, len)
+            hixl_transfer_write(self.ptr, c_eid.as_ptr(), local_addr, remote_addr, len, timeout_ms)
         };
         if ret == 0 { Ok(()) } else { Err(ret) }
     }
@@ -128,4 +157,11 @@ impl Drop for HixlEngine {
             unsafe { hixl_cleanup(self.ptr) };
         }
     }
+}
+
+/// Probe whether HCCS IPC memory export works on the given device.
+/// Returns `true` if HCCS is available, `false` otherwise.
+pub fn probe_hccs(dev: i32) -> bool {
+    let ret = unsafe { hixl_probe_hccs(dev) };
+    ret == 0
 }

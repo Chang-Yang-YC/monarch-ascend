@@ -26,7 +26,9 @@ Architecture:
 
 import os
 import sys
-os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
+# Transport: defaults to HCCS (intra-supernode).
+# HCCS requires 2MB-aligned device memory — use alloc_aligned_tensor().
+# Set MONARCH_HIXL_TRANSPORT=roce to force RoCE if HCCS is unavailable.
 os.environ["PYTHONPATH"] = os.pathsep.join(sys.path)
 
 _hixl_lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build")
@@ -52,6 +54,7 @@ except ImportError:
 
 from monarch.actor import Actor, endpoint, this_host
 from monarch._src.rdma.xdma import XDMABuffer as RDMABuffer
+from monarch._src.rdma.xdma import alloc_aligned_tensor
 
 # Config
 G = 8  # group size for GRPO
@@ -123,7 +126,6 @@ class ReplayBuffer(Actor):
 class Scorer(Actor):
     def __init__(self, trajectory_queue: Any, replay_buffer: Any, device_id: int = 0):
         os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
         torch.npu.set_device(device_id)
         self.trajectory_queue = trajectory_queue
         self.replay_buffer = replay_buffer
@@ -173,7 +175,7 @@ class Scorer(Actor):
         self.running = False
 
 
-WEIGHT_BUF_SIZE = 4096  # pre-calculated: must be >= total model bytes, 4KB aligned
+WEIGHT_BUF_SIZE = 2 * 1024 * 1024  # 2MB — HCCS requires 2MB-aligned buffers
 
 
 class Learner(Actor):
@@ -182,7 +184,6 @@ class Learner(Actor):
               f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')} "
               f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT_SET')}", flush=True)
         os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
         torch.npu.set_device(device_id)
 
         self.model = nn.Sequential(
@@ -200,13 +201,13 @@ class Learner(Actor):
         self.replay_buffer = replay_buffer
         self.batch_size = 2
         self.generators: Optional[Any] = None
-        self._flat_weights = torch.ones(
-            WEIGHT_BUF_SIZE // 4, dtype=torch.float32, device=f"npu:{device_id}"
-        ).view(torch.uint8)
+        self._flat_weights, self._flat_weights_backing = alloc_aligned_tensor(
+            WEIGHT_BUF_SIZE, dtype=torch.uint8, device=f"npu:{device_id}"
+        )
         torch.npu.synchronize()
         print(
             f"[Learner] Weight buffer: addr={hex(self._flat_weights.data_ptr())}, "
-            f"size={WEIGHT_BUF_SIZE}",
+            f"size={WEIGHT_BUF_SIZE}, aligned={self._flat_weights.data_ptr() % (2*1024*1024) == 0}",
             flush=True,
         )
         self._flat_buf: Optional[RDMABuffer] = None
@@ -317,7 +318,6 @@ class Generator(Actor):
               f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')} "
               f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT_SET')}", flush=True)
         os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
         torch.npu.set_device(device_id)
 
         self._device_id = device_id
@@ -365,7 +365,7 @@ class Generator(Actor):
 
     def _ensure_local_flat(self) -> torch.Tensor:
         if self._local_flat is None:
-            self._local_flat = torch.zeros(
+            self._local_flat, self._local_flat_backing = alloc_aligned_tensor(
                 WEIGHT_BUF_SIZE, dtype=torch.uint8, device=f"npu:{self._device_id}"
             )
             torch.npu.synchronize()

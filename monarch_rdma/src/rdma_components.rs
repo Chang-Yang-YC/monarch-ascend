@@ -110,9 +110,10 @@ impl RdmaRemoteBuffer {
         &self,
         client: &(impl context::Actor + Send + Sync),
         local: Arc<dyn RdmaLocalMemory>,
-        _timeout: u64,
+        timeout: u64,
     ) -> Result<bool, anyhow::Error> {
         let hixl_buf = self.resolve_hixl()?;
+        let timeout_ms = timeout.min(i32::MAX as u64) as i32;
 
         crate::backend::hixl::manager_actor::register_mem_if_needed(
             local.addr(),
@@ -126,25 +127,27 @@ impl RdmaRemoteBuffer {
         )
         .await?;
 
-        let state = crate::backend::hixl::manager_actor::get_hixl_state()?;
-        state
-            .engine
-            .transfer_write(
-                &hixl_buf.engine_id,
-                local.addr(),
-                hixl_buf.addr,
-                local.size(),
-            )
-            .map_err(|ret| {
-                anyhow::anyhow!(
-                    "hixl_transfer_write failed: local={:#x} remote={:#x}@{} len={} ret={}",
+        crate::backend::hixl::manager_actor::with_state(|state| {
+            state
+                .engine
+                .transfer_write(
+                    &hixl_buf.engine_id,
                     local.addr(),
                     hixl_buf.addr,
-                    hixl_buf.engine_id,
                     local.size(),
-                    ret,
+                    timeout_ms,
                 )
-            })?;
+                .map_err(|ret| {
+                    anyhow::anyhow!(
+                        "hixl_transfer_write failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                        local.addr(),
+                        hixl_buf.addr,
+                        hixl_buf.engine_id,
+                        local.size(),
+                        ret,
+                    )
+                })
+        })?;
 
         Ok(true)
     }
@@ -154,9 +157,10 @@ impl RdmaRemoteBuffer {
         &self,
         client: &(impl context::Actor + Send + Sync),
         local: Arc<dyn RdmaLocalMemory>,
-        _timeout: u64,
+        timeout: u64,
     ) -> Result<bool, anyhow::Error> {
         let hixl_buf = self.resolve_hixl()?;
+        let timeout_ms = timeout.min(i32::MAX as u64) as i32;
 
         crate::backend::hixl::manager_actor::register_mem_if_needed(
             local.addr(),
@@ -170,33 +174,29 @@ impl RdmaRemoteBuffer {
         )
         .await?;
 
-        let state = crate::backend::hixl::manager_actor::get_hixl_state()?;
         for attempt in 0..3u32 {
-            match state.engine.transfer_read(
-                &hixl_buf.engine_id,
-                local.addr(),
-                hixl_buf.addr,
-                local.size(),
-            ) {
+            let result = crate::backend::hixl::manager_actor::with_state(|state| {
+                state.engine.transfer_read(
+                    &hixl_buf.engine_id,
+                    local.addr(),
+                    hixl_buf.addr,
+                    local.size(),
+                    timeout_ms,
+                ).map_err(|ret| anyhow::anyhow!(
+                    "hixl_transfer_read failed: local={:#x} remote={:#x}@{} len={} ret={}",
+                    local.addr(), hixl_buf.addr, hixl_buf.engine_id, local.size(), ret,
+                ))
+            });
+            match result {
                 Ok(()) => return Ok(true),
-                Err(ret) if attempt < 2 => {
+                Err(_) if attempt < 2 => {
                     tracing::warn!(
-                        "[hixl] transfer_read attempt {} failed (ret={}), retrying in 1s…",
+                        "[hixl] transfer_read attempt {} failed, retrying in 1s…",
                         attempt,
-                        ret,
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
-                Err(ret) => {
-                    return Err(anyhow::anyhow!(
-                        "hixl_transfer_read failed: local={:#x} remote={:#x}@{} len={} ret={}",
-                        local.addr(),
-                        hixl_buf.addr,
-                        hixl_buf.engine_id,
-                        local.size(),
-                        ret,
-                    ));
-                }
+                Err(e) => return Err(e),
             }
         }
         unreachable!()
