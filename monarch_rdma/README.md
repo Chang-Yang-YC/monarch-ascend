@@ -2,97 +2,129 @@
 
 ## Overview
 
-Monarch RDMA is a Rust library that provides high-performance Remote Direct Memory Access (RDMA) capabilities for the Monarch framework. It enables direct memory access from the memory of one computer into the memory of another without involving either computer's operating system, resulting in high-throughput, low-latency networking with minimal CPU overhead.
+Monarch RDMA is a Rust library that provides high-performance single-sided communication capabilities for the Monarch framework. It supports two backends:
+
+- **GPU (ibverbs/rdmaxcel)**: RDMA over InfiniBand / RoCE for NVIDIA GPUs, using GPUDirect RDMA.
+- **NPU (HiXL)**: Single-sided communication for Huawei Ascend NPUs, supporting HCCS (intra-supernode) and RoCE (inter-node) transports.
+
+Both backends share a unified actor-based API (`RdmaManagerActor`) and common Python interface (`RDMABuffer` / `XDMABuffer`), enabling direct memory-to-memory transfers with minimal CPU overhead.
 
 ## Features
 
-- **High-performance RDMA communication**: Enables direct memory-to-memory transfers between machines
-- **CUDA integration**: Support for GPU memory transfers via RDMA with GPUDirect RDMA
-- **Actor-based API**: Clean, actor-based interface for managing RDMA resources and connections
-- **Comprehensive error handling**: Robust error handling for RDMA operations
-- **Memory region management**: Efficient registration and management of memory regions for RDMA operations
+- **Dual-backend support**: GPU (ibverbs) and NPU (HiXL), selected at compile time via Cargo features
+- **Actor-based API**: Clean, actor-based interface (`RdmaManagerActor`) for managing connections and resources
+- **HCCS / RoCE transport selection** (NPU): Defaults to HCCS for intra-supernode; RoCE for cross-node, controllable via `MONARCH_HIXL_TRANSPORT`
+- **Reference-counted memory registration** (NPU): Efficient per-buffer registration with automatic deregistration on release
+- **Bidirectional connection coordination**: Both backends establish connections from both sides for robustness
+- **Timeout propagation**: User-specified timeouts are passed through to the underlying transport library
 
 ## System Requirements
 
-### Hardware Requirements
+### GPU Backend
 
-- RDMA-capable network interface card (NIC), such as Mellanox ConnectX series
-- For GPU integration: NVIDIA GPU with CUDA support
+#### Hardware
+- RDMA-capable NIC (e.g., Mellanox ConnectX series)
+- NVIDIA GPU with CUDA support
 
-### Software Requirements
+#### Software
+- **libibverbs**: RDMA verbs library
+- **CUDA headers**: For GPU memory integration
+- **GPUDirect RDMA**: For direct GPU memory access via RDMA
 
-#### Required Libraries
-
-- **libibverbs**: RDMA verbs library for interacting with RDMA hardware
-- **CUDA headers**: Required for GPU memory integration (if using CUDA features)
-- **GPUDirect RDMA**: Required for direct GPU memory access via RDMA (see installation instructions below)
-
-#### Installing GPUDirect RDMA
-
-For GPU integration, you need to install the GPUDirect RDMA library. Follow the installation guide at:
+Install GPUDirect RDMA following:
 https://docs.nvidia.com/networking/display/gpudirectrdmav18/installing+gpudirect+rdma
 
-After installation, you can verify that GPUDirect RDMA is properly installed by checking if the nvidia_peermem kernel module is loaded:
-
+Verify installation:
 ```bash
 lsmod | grep nvidia_peermem
 ```
 
-If the module is loaded, you should see output similar to:
-```
-nvidia_peermem         16384  0
-```
-
-#### Configuration for GPUDirect RDMA
-
-If you're using CUDA this library assumes GPUDirect is enabled, you need to enable peer memory mapping by adding the following to your `/etc/modprobe.d/nvidia.conf` file:
-
+Enable peer memory mapping in `/etc/modprobe.d/nvidia.conf`:
 ```
 options nvidia NVreg_RegistryDwords="PeerMappingOverride=1;"
 ```
 
-After adding this configuration, you'll need to reload the NVIDIA kernel module:
+### NPU Backend
+
+#### Hardware
+- Huawei Ascend 910B NPU (2+ cards recommended)
+- HCCS interconnect (intra-supernode) or RoCE NIC (cross-node)
+
+#### Software
+- **CANN 9.0+**: Huawei's compute architecture (`source /path/to/cann/set_env.sh`)
+- **torch + torch_npu**: Version matching the installed CANN
+- **libcann_hixl.so + libascendcl.so**: Provided by CANN SDK
+
+## Building
+
+### GPU (default)
 
 ```bash
-sudo rmmod nvidia
-sudo modprobe nvidia
+cargo build -p monarch_extension
 ```
 
-#### Verifying Installation with validate_execution_context
+### NPU
 
-After configuring GPUDirect RDMA, you can use the `validate_execution_context` function to verify that your environment is properly configured for RDMA operations:
-
-```rust
-// In your Rust code
-use monarch_rdma::rdma_components::validate_execution_context;
-
-async fn check_environment() -> Result<(), anyhow::Error> {
-    validate_execution_context().await
-}
+```bash
+PYO3_PYTHON=/path/to/python cargo build -p monarch_extension \
+  --no-default-features \
+  --features "ascend_engine,distributed_sql_telemetry,extension-module"
 ```
 
-This function checks for the presence of required kernel modules, device files, and proper permissions. A successful result indicates that your system is correctly configured for RDMA operations with GPUDirect support.
-
-## Usage
-
-The library provides several core components:
-
-- `RdmaDomain`: Manages RDMA resources including context, protection domain, and memory region
-- `RdmaQueuePair`: Handles communication between endpoints via queue pairs and completion queues
-- `RdmaBuffer`: Represents a memory buffer that can be used for RDMA operations
-- `RdmaManagerActor`: Actor that manages RDMA resources and connections
-
-### Basic Example
-
-See the `examples` directory for more detailed usage examples, and tests within the library. Users should generally leverage rdma_manager_actor to manage the RDMA resources and connections.
+The `hixl-sys` crate's `build.rs` automatically compiles the C shim (`hixl_shim.cpp`) using the `cc` crate and links against CANN libraries.
 
 ## Architecture
 
-The library is organized into several key components:
+```
+RdmaManagerActor (shared)
+├── GPU: IbvManagerActor          NPU: HixlManagerActor
+│        ├─ ibv_open_device             ├─ Hixl::Initialize(engine_id)
+│        ├─ QP create/connect           ├─ Hixl::Connect(peer_engine_id)
+│        ├─ ibv_reg_mr / dereg          ├─ Hixl::RegisterMem / DeregisterMem
+│        └─ QP put/get (WRITE/READ)     └─ Hixl::TransferSync (WRITE/READ)
+├── rdma_components.rs  (RdmaRemoteBuffer — unified read/write API)
+└── rdma_manager_actor.rs (shared message routing, transport_level reporting)
+```
 
-- **ibverbs_primitives.rs**: Low-level primitives for interacting with the RDMA hardware
-- **rdma_components.rs**: Core RDMA components like domains, queue pairs, and buffers
-- **rdma_manager_actor.rs**: Actor-based API for managing RDMA resources and connections
+### Key Files
+
+| Component | GPU | NPU |
+|-----------|-----|-----|
+| Manager Actor | `backend/ibverbs/manager_actor.rs` | `backend/hixl/manager_actor.rs` |
+| FFI Bindings | `rdmaxcel-sys/src/lib.rs` | `hixl-sys/src/lib.rs` |
+| C Shim | rdmaxcel C library | `hixl-sys/cpp/hixl_shim.cpp` |
+| Build Script | `rdmaxcel-sys/build.rs` | `hixl-sys/build.rs` |
+| Python Buffer | `python/monarch/_src/rdma/rdma.py` | `python/monarch/_src/rdma/xdma.py` |
+
+## Environment Variables
+
+### NPU-specific
+
+| Variable | Description |
+|----------|-------------|
+| `MONARCH_HIXL_TRANSPORT` | Transport selection: `hccs` (default), `roce`, or `auto` |
+| `MONARCH_NPU_DEVICE` | NPU device index for HiXL engine |
+| `MONARCH_HIXL_USE_LOOPBACK` | Force engine ID to use 127.0.0.1 instead of real IP |
+| `HCCL_NPU_SOCKET_PORT_RANGE` | Set to `auto` automatically in HCCS mode |
+
+### GPU-specific
+
+| Variable | Description |
+|----------|-------------|
+| `CUDA_VISIBLE_DEVICES` | Control visible GPUs |
+| `MONARCH_DEBUG_RDMA` | Print device mapping info |
+
+## NPU Memory Alignment
+
+HCCS transport requires **2MB-aligned** device memory addresses. Use the provided helper:
+
+```python
+from monarch._src.rdma.xdma import alloc_aligned_tensor
+
+tensor = alloc_aligned_tensor((size,), dtype=torch.float32, device="npu:0")
+```
+
+Standard `torch.zeros(..., device="npu:0")` allocations may not be 2MB-aligned. Unaligned memory will fall back to RoCE or fail with error 503900 during connect.
 
 ## License
 

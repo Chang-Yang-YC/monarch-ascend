@@ -8,6 +8,23 @@ Ascend NPU 单边通信 (HiXL) 集成测试集，覆盖从底层原生 API 到�
 - torch + torch_npu (版本匹配 CANN)
 - conda 环境: `monarch_ascend`
 - 至少 2 张 NPU 卡 (910B)
+- Rust 编译的 `_rust_bindings.so`（Plan B Rust 后端）
+
+## 通信模式
+
+当前 HiXL 后端支持两种传输模式，通过环境变量 `MONARCH_HIXL_TRANSPORT` 控制：
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| `hccs` (默认) | 走 HCCS 高速互联 | 同一超节点内的 NPU 卡间通信 |
+| `roce` | 走 RoCE 以太网 | 跨超节点通信，或 HCCS 不可用时的 fallback |
+
+**HCCS 模式要求设备内存地址 2MB 对齐**。使用 `alloc_aligned_tensor()` 分配对齐的 tensor：
+
+```python
+from monarch._src.rdma.xdma import alloc_aligned_tensor
+buf = alloc_aligned_tensor((size,), dtype=torch.float32, device="npu:0")
+```
 
 ## 目录结构
 
@@ -30,8 +47,8 @@ tests/hixl/
 
 | 文件 | 说明 |
 |------|------|
-| `test_hixl_bridge_minimal.py` | **核心验收用例**。两卡两 mesh，Producer(NPU0) 创建 RDMABuffer，Consumer(NPU1) 通过 write_from/read_into 跨卡读写 |
-| `test_hixl_python_transfer.py` | Python ctypes 路径的完整 RDMABuffer 流程验证 |
+| `test_hixl_bridge_minimal.py` | **核心验收用例**。两卡两 mesh，Producer(NPU0) 创建 RDMABuffer/XDMABuffer，Consumer(NPU1) 通过 write_from/read_into 跨卡读写 |
+| `test_hixl_python_transfer.py` | Python ctypes 路径的完整 RDMABuffer 流程验证（旧路径，Plan B 已替代）|
 | `test_hixl_rdma_e2e.py` | HIXL RDMA 端到端：Producer 建 buffer，Consumer 通过 HIXL 写入 |
 
 ### unit/ — 单元测试
@@ -40,7 +57,7 @@ tests/hixl/
 |------|------|
 | `test_npu_backend.py` | NPU 后端基础验证（环境、torch_npu、设备状态）|
 | `test_hixl_rdma_minimal.py` | 最小 RDMABuffer 创建测试 |
-| `test_hixl_actor_ctypes.py` | 从 Monarch actor 中直接 ctypes 调用 HIXL |
+| `test_hixl_actor_ctypes.py` | 从 Monarch actor 中直接 ctypes 调用 HIXL（旧路径）|
 | `test_hixl_direct.py` | torch_npu vs aclrtMalloc 内存对比传输 |
 | `test_hixl_rdma_manager_effect.py` | RdmaManagerActor 对 HIXL 的影响隔离 |
 | `test_hixl_buffer_effect.py` | RDMABuffer 创建与 HIXL 引擎共存验证 |
@@ -72,14 +89,14 @@ tests/hixl/
 
 | 文件 | 说明 |
 |------|------|
-| `test_grpo_npu.py` | GRPO 训练 (Learner + Generator 双 mesh，跨卡 HIXL 权重同步) |
+| `test_grpo_npu.py` | **主验证用例**。GRPO 训练 (Learner + Generator 双 mesh，跨卡 HIXL 权重同步)。默认走 HCCS，需 2MB 对齐内存 |
 | `test_grpo_npu_simple.py` | 简化 GRPO (单 mesh，无 RDMA) |
 
 ### util/ — 工具代码
 
 | 文件 | 说明 |
 |------|------|
-| `test_hixl_from_python.cpp` | 供 Python ctypes 调用的 HIXL 共享库 (run_server/run_client_transfer) |
+| `test_hixl_from_python.cpp` | 供 Python ctypes 调用的 HIXL 共享库（旧路径，Plan B 已替代）|
 | `hixl_trampoline.c` | 信号掩码重置 trampoline，解决 HIXL 修改信号处理的问题 |
 
 ## 快速运行
@@ -88,15 +105,22 @@ tests/hixl/
 # 环境准备
 conda activate monarch_ascend
 source /root/hzz/cann-9.0.0-beta.1/set_env.sh
-export HCCL_INTRA_ROCE_ENABLE=1
 
-# 核心验收 — 两卡 HIXL 通信
+# ---- 编译 Rust 后端 (Plan B) ----
+PYO3_PYTHON=$(which python) cargo build -p monarch_extension \
+  --no-default-features \
+  --features "ascend_engine,distributed_sql_telemetry,extension-module"
+
+# ---- 核心验收 — GRPO 双 mesh HIXL 权重同步 ----
+python tests/hixl/app/test_grpo_npu.py
+
+# ---- 两卡 bridge 通信 ----
 python tests/hixl/e2e/test_hixl_bridge_minimal.py
 
-# NPU 基础环境检查
+# ---- NPU 基础环境检查 ----
 python tests/hixl/unit/test_npu_backend.py
 
-# 编译并运行 C++ 原生测试
+# ---- 编译并运行 C++ 原生测试 ----
 cd tests/hixl && make && make run-connect
 ```
 
@@ -104,9 +128,17 @@ cd tests/hixl && make && make run-connect
 
 | 变量 | 说明 |
 |------|------|
-| `HCCL_INTRA_ROCE_ENABLE=1` | **必须**。启用机内 RoCE 数据面 |
-| `MONARCH_NPU_DEVICE` | HIXL bridge 使用的物理 NPU 设备号 |
-| `MONARCH_PYTHON_HIXL_ENGINE_ID` | HIXL engine ID (ip:port) |
-| `MONARCH_HIXL_LIB` | libtest_hixl.so 路径 (默认 build/libtest_hixl.so) |
-| `MONARCH_HIXL_IP` | engine_id 使用的 IP (默认 127.0.0.1) |
-| `MONARCH_HIXL_USE_REAL_IP` | 使用真实 IP 替代 loopback |
+| `MONARCH_HIXL_TRANSPORT` | 传输模式选择：`hccs`（默认）、`roce`、`auto` |
+| `MONARCH_NPU_DEVICE` | HIXL 使用的物理 NPU 设备号 |
+| `MONARCH_HIXL_USE_LOOPBACK` | 强制 engine ID 使用 127.0.0.1（调试用） |
+| `HCCL_NPU_SOCKET_PORT_RANGE` | HCCS 模式自动设为 `auto`，无需手动配置 |
+
+### 已废弃
+
+| 变量 | 替代方案 |
+|------|----------|
+| `HCCL_INTRA_ROCE_ENABLE=1` | 不再需要，HCCS 为默认。显式使用 RoCE 请设 `MONARCH_HIXL_TRANSPORT=roce` |
+| `MONARCH_PYTHON_HIXL_ENGINE_ID` | Rust 后端自动生成 engine ID |
+| `MONARCH_HIXL_LIB` | C shim 已内置于 `hixl-sys` crate，由 `build.rs` 编译 |
+| `MONARCH_HIXL_IP` | 已由 `local_ip_for_hixl()` 自动获取真实 IP |
+| `MONARCH_HIXL_USE_REAL_IP` | 默认已使用真实 IP，无需手动设置 |
