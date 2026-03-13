@@ -257,6 +257,12 @@ def _initialize_env(worker_point: Point, proc_id: str) -> None:
         elif "gpu" in worker_point:
             local_rank = worker_point["gpu"]
             gpus_per_host = worker_point.size("gpu")
+        elif "npus" in worker_point:
+            local_rank = worker_point["npus"]
+            gpus_per_host = worker_point.size("npus")
+        elif "npu" in worker_point:
+            local_rank = worker_point["npu"]
+            gpus_per_host = worker_point.size("npu")
         else:
             gpus_per_host = _local_device_count()
             local_rank = worker_rank % gpus_per_host
@@ -276,9 +282,19 @@ def _initialize_env(worker_point: Point, proc_id: str) -> None:
         }
         os.environ.update(process_env)
         pdb.set_trace = _set_trace
-        # workaround for set_manual_seed somehow not working if cuda is not initialized\
+        # workaround for set_manual_seed somehow not working if cuda is not initialized
         if torch.cuda.is_available():
             torch.cuda.init()
+        else:
+            try:
+                import torch_npu  # noqa: F401
+                if hasattr(torch, "npu") and torch.npu.is_available():
+                    # ASCEND_RT_VISIBLE_DEVICES is already set to local_rank,
+                    # so the process only sees 1 NPU as logical device 0.
+                    # Analogous to torch.cuda.init() which defaults to device 0.
+                    torch.npu.set_device(0)
+            except ImportError:
+                pass
 
         def check_set_device(device):
             import os

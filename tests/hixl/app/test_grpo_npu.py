@@ -11,17 +11,22 @@ GRPO on NPU — Two-mesh test (Learner mesh + Generator mesh)
 Adapted from docs/source/examples/grpo_actor.py for Ascend NPU.
 
 Changes from GPU version:
-  - "cuda" → "npu"
-  - "gpus" → "gpus" (monarch maps this to the accelerator)
+  - "cuda" → "npu", per_host={"gpus": N} → per_host={"npus": N}
   - Replaced torch.distributions.Categorical with manual softmax+multinomial
     (Categorical may not be fully supported on NPU)
   - Removed kl_divergence import (replaced with manual computation)
+  - HCCS requires 2MB-aligned buffers — uses alloc_aligned_tensor() + flat buffer
 
 Architecture:
   learner_mesh (1 NPU): Learner + Scorer + TrajectoryQueue + ReplayBuffer
-  gen_mesh     (2 NPU): Generator ×2
+  gen_mesh     (1 NPU): Generator ×1
 
-  Mesh间通信: Generator.update() reads weights from Learner via RDMABuffer (HIXL)
+  Mesh间通信: Generator.update() reads weights from Learner via XDMABuffer (HIXL)
+
+Device management:
+  Uses npu_device(N) bootstrap to set ASCEND_RT_VISIBLE_DEVICES=N,
+  isolating each process to a single NPU card (logical device 0).
+  Actor constructors don't need manual device management.
 """
 
 import os
@@ -38,9 +43,8 @@ if os.path.isdir(_hixl_lib_dir):
 import asyncio
 import copy
 import random
-import traceback
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -56,11 +60,21 @@ from monarch.actor import Actor, endpoint, this_host
 from monarch._src.rdma.xdma import XDMABuffer as RDMABuffer
 from monarch._src.rdma.xdma import alloc_aligned_tensor
 
-# Config
 G = 8  # group size for GRPO
 STATE_DIM = 4
 ACTION_DIM = 4
 DEVICE = "npu"
+
+
+def npu_device(dev_id: int):
+    """Bootstrap function: bind this process to a specific NPU."""
+    def _bootstrap():
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(dev_id)
+        os.environ["MONARCH_NPU_DEVICE"] = "0"
+        import torch
+        import torch_npu  # noqa: F401
+        torch.npu.set_device(0)
+    return _bootstrap
 
 
 @dataclass
@@ -124,9 +138,7 @@ class ReplayBuffer(Actor):
 
 
 class Scorer(Actor):
-    def __init__(self, trajectory_queue: Any, replay_buffer: Any, device_id: int = 0):
-        os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        torch.npu.set_device(device_id)
+    def __init__(self, trajectory_queue: Any, replay_buffer: Any):
         self.trajectory_queue = trajectory_queue
         self.replay_buffer = replay_buffer
         self.net = nn.Sequential(
@@ -179,12 +191,10 @@ WEIGHT_BUF_SIZE = 2 * 1024 * 1024  # 2MB — HCCS requires 2MB-aligned buffers
 
 
 class Learner(Actor):
-    def __init__(self, replay_buffer: Any, device_id: int = 0):
-        print(f"[Learner.__init__] PID={os.getpid()} device_id={device_id} "
-              f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')} "
-              f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT_SET')}", flush=True)
-        os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        torch.npu.set_device(device_id)
+    def __init__(self, replay_buffer: Any):
+        print(f"[Learner.__init__] PID={os.getpid()} "
+              f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')}",
+              flush=True)
 
         self.model = nn.Sequential(
             nn.Linear(STATE_DIM, 16), nn.Tanh(), nn.Linear(16, ACTION_DIM)
@@ -202,7 +212,7 @@ class Learner(Actor):
         self.batch_size = 2
         self.generators: Optional[Any] = None
         self._flat_weights, self._flat_weights_backing = alloc_aligned_tensor(
-            WEIGHT_BUF_SIZE, dtype=torch.uint8, device=f"npu:{device_id}"
+            WEIGHT_BUF_SIZE, dtype=torch.uint8, device=DEVICE
         )
         torch.npu.synchronize()
         print(
@@ -313,14 +323,11 @@ class GeneratorState:
 
 
 class Generator(Actor):
-    def __init__(self, weight_buf, weight_metadata, trajectory_queue, device_id: int = 1):
-        print(f"[Generator.__init__] PID={os.getpid()} device_id={device_id} "
-              f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')} "
-              f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT_SET')}", flush=True)
-        os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        torch.npu.set_device(device_id)
+    def __init__(self, weight_buf, weight_metadata, trajectory_queue):
+        print(f"[Generator.__init__] PID={os.getpid()} "
+              f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')}",
+              flush=True)
 
-        self._device_id = device_id
         self._local_flat: Optional[torch.Tensor] = None
 
         self.model = nn.Sequential(
@@ -366,49 +373,10 @@ class Generator(Actor):
     def _ensure_local_flat(self) -> torch.Tensor:
         if self._local_flat is None:
             self._local_flat, self._local_flat_backing = alloc_aligned_tensor(
-                WEIGHT_BUF_SIZE, dtype=torch.uint8, device=f"npu:{self._device_id}"
+                WEIGHT_BUF_SIZE, dtype=torch.uint8, device=DEVICE
             )
             torch.npu.synchronize()
         return self._local_flat
-
-    @endpoint
-    async def test_ctypes_transfer(self) -> str:
-        """Direct ctypes HiXL transfer test, bypassing Rust RdmaBuffer."""
-        import ctypes
-        lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "libtest_hixl.so")
-        lib = ctypes.CDLL(lib_path)
-        lib.hixl_init_engine.argtypes = [ctypes.c_int, ctypes.c_char_p]
-        lib.hixl_init_engine.restype = ctypes.c_void_p
-        lib.hixl_connect.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        lib.hixl_connect.restype = ctypes.c_int
-        lib.hixl_register_mem.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
-        lib.hixl_register_mem.restype = ctypes.c_int
-        lib.hixl_transfer_read.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
-        lib.hixl_transfer_read.restype = ctypes.c_int
-        lib.hixl_cleanup.argtypes = [ctypes.c_void_p]
-
-        ext_info = self.weight_buf._buffer.external_backend_info()
-        remote_eid, remote_addr_str = ext_info.split(",")
-        remote_addr = int(remote_addr_str)
-
-        my_eid = f"127.0.0.1:{60000 + self._device_id}"
-        ctx = lib.hixl_init_engine(self._device_id, my_eid.encode())
-        if not ctx:
-            return "FAIL: init_engine returned null"
-
-        local_buf = torch.zeros(WEIGHT_BUF_SIZE, dtype=torch.uint8, device=f"npu:{self._device_id}")
-        torch.npu.synchronize()
-        lib.hixl_register_mem(ctx, local_buf.data_ptr(), local_buf.numel())
-        lib.hixl_connect(ctx, remote_eid.encode())
-        import time; time.sleep(1)
-
-        ret = lib.hixl_transfer_read(ctx, remote_eid.encode(),
-                                      local_buf.data_ptr(), remote_addr, local_buf.numel())
-        lib.hixl_cleanup(ctx)
-        if ret == 0:
-            return "SUCCESS"
-        return f"FAIL: ret={ret}"
 
     @endpoint
     async def update(self, version: int) -> None:
@@ -435,20 +403,20 @@ async def main():
     print("=" * 60)
 
     # Two meshes, each on a different physical NPU.
-    # Device assignment at the application layer, same as GPU users
-    # would do torch.cuda.set_device(rank).
-    learner_mesh = this_host().spawn_procs(per_host={"procs": 1})
-    gen_mesh = this_host().spawn_procs(per_host={"procs": 1})
+    # npu_device(N) sets ASCEND_RT_VISIBLE_DEVICES=N so each process
+    # only sees one NPU card as logical device 0.
+    learner_mesh = this_host().spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(0))
+    gen_mesh = this_host().spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
 
-    print("[1/7] Spawning actors on learner_mesh (NPU 0)...")
+    print("[1/6] Spawning actors on learner_mesh (NPU 0)...")
     traj_q = learner_mesh.spawn("traj", TrajectoryQueue)
     replay_buf = learner_mesh.spawn("rb", ReplayBuffer)
-    learner = learner_mesh.spawn("learner", Learner, replay_buf, 0)
-    scorer = learner_mesh.spawn("scorer", Scorer, traj_q, replay_buf, 0)
+    learner = learner_mesh.spawn("learner", Learner, replay_buf)
+    scorer = learner_mesh.spawn("scorer", Scorer, traj_q, replay_buf)
 
     print("[2/6] Getting weight handles and spawning generators (NPU 1)...")
     flat_buf, weight_meta = await learner.weights_handle.call_one()
-    generators = gen_mesh.spawn("generator", Generator, flat_buf, weight_meta, traj_q, 1)
+    generators = gen_mesh.spawn("generator", Generator, flat_buf, weight_meta, traj_q)
     await learner.init_generators.call(generators)
 
     print("[3/6] Initial generation...")

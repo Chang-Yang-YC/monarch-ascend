@@ -14,9 +14,6 @@ import os
 import sys
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
-# NOTE: Do NOT set expandable_segments — it uses virtual memory mapping
-# which is incompatible with HIXL's RegisterMem/TransferSync.
-os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
 
 import torch
 
@@ -28,6 +25,17 @@ except ImportError:
 
 from monarch.actor import Actor, endpoint, this_host
 from monarch.rdma import RDMABuffer
+
+
+def npu_device(dev_id: int):
+    """Bootstrap: isolate this process to a single NPU."""
+    def _bootstrap():
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(dev_id)
+        os.environ["MONARCH_NPU_DEVICE"] = "0"
+        import torch
+        import torch_npu  # noqa: F401
+        torch.npu.set_device(0)
+    return _bootstrap
 
 
 class Producer(Actor):
@@ -63,21 +71,6 @@ class Consumer(Actor):
         return local.sum().cpu().item()
 
 
-def use_npu(dev_id: int):
-    def _bootstrap():
-        os.environ["MONARCH_NPU_DEVICE"] = str(dev_id)
-        os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
-        import torch
-        import torch_npu  # noqa: F401
-        torch.npu.set_device(dev_id)
-        from monarch._src.rdma.hixl_transfer import compute_engine_id
-        eid = compute_engine_id()
-        os.environ["MONARCH_PYTHON_HIXL_ENGINE_ID"] = eid
-        print(f"[PID={os.getpid()}] NPU {dev_id} ready, HIXL engine_id={eid}", flush=True)
-
-    return _bootstrap
-
-
 async def main():
     print("=" * 60)
     print("Minimal HIXL bridge repro (2 meshes, 2 cards)")
@@ -86,13 +79,13 @@ async def main():
     print("=" * 60)
 
     host = this_host()
-    producer_mesh = host.spawn_procs(per_host={"gpus": 1}, bootstrap=use_npu(0))
-    consumer_mesh = host.spawn_procs(per_host={"gpus": 1}, bootstrap=use_npu(1))
+    producer_mesh = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(0))
+    consumer_mesh = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
 
     producer = producer_mesh.spawn("producer", Producer)
     consumer = consumer_mesh.spawn("consumer", Consumer)
 
-    print("[1/3] Build remote handle...")
+    print("[1/4] Build remote handle...")
     handle = await producer.get_handle.call_one()
     expected = await producer.get_sum.call_one()
     print(f"      producer sum = {expected}")

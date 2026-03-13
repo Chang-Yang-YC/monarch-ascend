@@ -4,21 +4,18 @@ End-to-end test for XDMABuffer — the NPU-specific single-sided communication p
 Verifies that XDMABuffer works correctly via the transport plugin registry,
 completely independent of rdma.py.
 
-Two proc meshes on the same host, each bound to a different NPU.
+Two proc meshes on the same host, each bound to a different NPU via
+per_host={"npus": 1} (automatic ASCEND_RT_VISIBLE_DEVICES isolation).
 
 Run:
     source /root/hzz/cann-9.0.0-beta.1/set_env.sh
-    HCCL_INTRA_ROCE_ENABLE=1 MONARCH_TRANSPORT_BACKEND=hixl \
     python tests/hixl/e2e/test_xdma_buffer.py
 """
 
 import os
 import sys
-import time
 import asyncio
 
-os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
-os.environ.setdefault("MONARCH_TRANSPORT_BACKEND", "hixl")
 os.environ["PYTHONPATH"] = os.pathsep.join(sys.path)
 
 import torch
@@ -28,18 +25,26 @@ from monarch._src.rdma.xdma import XDMABuffer
 from monarch._src.rdma.transport import get_transport
 
 
+def npu_device(dev_id: int):
+    """Bootstrap: isolate this process to a single NPU."""
+    def _bootstrap():
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(dev_id)
+        os.environ["MONARCH_NPU_DEVICE"] = "0"
+        import torch
+        import torch_npu  # noqa: F401
+        torch.npu.set_device(0)
+    return _bootstrap
+
+
 class Producer(Actor):
-    def __init__(self, device_id: int):
-        os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
-        os.environ.setdefault("MONARCH_TRANSPORT_BACKEND", "hixl")
-        torch.npu.set_device(device_id)
-        print(f"[Producer PID={os.getpid()}] bound to NPU {device_id}", flush=True)
+    def __init__(self):
+        print(f"[Producer PID={os.getpid()}] "
+              f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')}",
+              flush=True)
 
     @endpoint
     async def create_buffer(self, fill_value: float) -> XDMABuffer:
-        dev_id = int(os.environ.get("MONARCH_NPU_DEVICE", "0"))
-        t = torch.ones(1024, dtype=torch.float32, device=f"npu:{dev_id}")
+        t = torch.ones(1024, dtype=torch.float32, device="npu")
         t.fill_(fill_value)
         torch.npu.synchronize()
         buf = XDMABuffer(t)
@@ -64,12 +69,10 @@ class Producer(Actor):
 
 
 class Consumer(Actor):
-    def __init__(self, device_id: int):
-        os.environ["MONARCH_NPU_DEVICE"] = str(device_id)
-        os.environ.setdefault("HCCL_INTRA_ROCE_ENABLE", "1")
-        os.environ.setdefault("MONARCH_TRANSPORT_BACKEND", "hixl")
-        torch.npu.set_device(device_id)
-        print(f"[Consumer PID={os.getpid()}] bound to NPU {device_id}", flush=True)
+    def __init__(self):
+        print(f"[Consumer PID={os.getpid()}] "
+              f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES', 'NOT_SET')}",
+              flush=True)
 
     @endpoint
     async def get_engine_id(self) -> str:
@@ -80,8 +83,7 @@ class Consumer(Actor):
 
     @endpoint
     async def read_from(self, buf: XDMABuffer) -> str:
-        dev_id = int(os.environ.get("MONARCH_NPU_DEVICE", "0"))
-        dst = torch.zeros(1024, dtype=torch.float32, device=f"npu:{dev_id}")
+        dst = torch.zeros(1024, dtype=torch.float32, device="npu")
         torch.npu.synchronize()
         try:
             buf.read_into(dst).get(timeout=30)
@@ -95,8 +97,7 @@ class Consumer(Actor):
 
     @endpoint
     async def write_to(self, buf: XDMABuffer, value: float) -> str:
-        dev_id = int(os.environ.get("MONARCH_NPU_DEVICE", "0"))
-        src = torch.ones(1024, dtype=torch.float32, device=f"npu:{dev_id}")
+        src = torch.ones(1024, dtype=torch.float32, device="npu")
         src.fill_(value)
         torch.npu.synchronize()
         try:
@@ -109,8 +110,7 @@ class Consumer(Actor):
 
     @endpoint
     async def read_and_verify(self, buf: XDMABuffer, expected: float) -> str:
-        dev_id = int(os.environ.get("MONARCH_NPU_DEVICE", "0"))
-        dst = torch.zeros(1024, dtype=torch.float32, device=f"npu:{dev_id}")
+        dst = torch.zeros(1024, dtype=torch.float32, device="npu")
         torch.npu.synchronize()
         try:
             buf.read_into(dst).get(timeout=30)
@@ -131,11 +131,11 @@ async def run_tests():
     host = this_host()
     results = []
 
-    mesh0 = host.spawn_procs(per_host={"procs": 1})
-    mesh1 = host.spawn_procs(per_host={"procs": 1})
+    mesh0 = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(0))
+    mesh1 = host.spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
 
-    producer = mesh0.spawn("producer", Producer, 0)
-    consumer = mesh1.spawn("consumer", Consumer, 1)
+    producer = mesh0.spawn("producer", Producer)
+    consumer = mesh1.spawn("consumer", Consumer)
 
     # Create a single shared buffer for all tests.
     # HCCS requires aligned addresses — using a single buffer avoids
