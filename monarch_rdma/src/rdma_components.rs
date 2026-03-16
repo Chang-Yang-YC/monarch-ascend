@@ -24,6 +24,8 @@ use crate::RdmaLocalMemory;
 use crate::RdmaManagerActor;
 use crate::RdmaOp;
 use crate::RdmaOpType;
+#[cfg(feature = "hixl")]
+use crate::EnsurePeerConnectedClient;
 use crate::ReleaseBufferClient;
 use crate::backend::RdmaBackendContext;
 
@@ -45,6 +47,95 @@ pub struct RdmaRemoteBuffer {
     pub backends: Vec<RdmaBackendContext>,
 }
 wirevalue::register_type!(RdmaRemoteBuffer);
+
+#[cfg(feature = "hixl")]
+async fn ensure_bidir_connected(
+    client: &(impl context::Actor + Send + Sync),
+    owner: &ActorRef<RdmaManagerActor>,
+    remote_engine_id: &str,
+    timeout_ms: i32,
+) -> Result<(), anyhow::Error> {
+    let strict_bidir = std::env::var("MONARCH_HIXL_STRICT_BIDIR_CONNECT")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    let local_engine_id = crate::backend::hixl::manager_actor::get_engine_id_wait(timeout_ms)?;
+    let handshake_trace_id = format!(
+        "hs:{}->{}:{}",
+        local_engine_id,
+        remote_engine_id,
+        std::process::id()
+    );
+    tracing::warn!(
+        "HIXL: bidir handshake start trace_id={} local_engine={} remote_engine={} timeout_ms={}",
+        handshake_trace_id,
+        local_engine_id,
+        remote_engine_id,
+        timeout_ms,
+    );
+
+    tracing::warn!(
+        "HIXL: bidir handshake local connect start trace_id={} remote_engine_id={}",
+        handshake_trace_id,
+        remote_engine_id,
+    );
+    if let Err(e) = crate::backend::hixl::manager_actor::hixl_connect_peer(remote_engine_id, timeout_ms)
+    {
+        tracing::error!(
+            "HIXL: bidir handshake local connect failed trace_id={} remote_engine_id={} err={}",
+            handshake_trace_id,
+            remote_engine_id,
+            e,
+        );
+        return Err(e);
+    }
+    tracing::warn!(
+        "HIXL: bidir handshake local connect done trace_id={} remote_engine_id={}",
+        handshake_trace_id,
+        remote_engine_id,
+    );
+
+    tracing::warn!(
+        "HIXL: bidir handshake remote ensure_peer_connected start trace_id={} peer_engine_id={} strict_bidir={}",
+        handshake_trace_id,
+        local_engine_id,
+        strict_bidir,
+    );
+    if let Err(e) = owner
+        .ensure_peer_connected(client, local_engine_id.clone())
+        .await
+    {
+        if strict_bidir {
+            tracing::error!(
+                "HIXL: bidir handshake remote ensure_peer_connected failed trace_id={} peer_engine_id={} err={}",
+                handshake_trace_id,
+                local_engine_id,
+                e,
+            );
+            return Err(e);
+        }
+
+        tracing::warn!(
+            "HIXL: bidir handshake remote ensure_peer_connected failed (non-strict, continue) trace_id={} peer_engine_id={} err={}",
+            handshake_trace_id,
+            local_engine_id,
+            e,
+        );
+    } else {
+        tracing::warn!(
+            "HIXL: bidir handshake remote ensure_peer_connected done trace_id={} peer_engine_id={}",
+            handshake_trace_id,
+            local_engine_id,
+        );
+    }
+
+    tracing::warn!(
+        "HIXL: bidir handshake complete trace_id={} local_engine={} remote_engine={}",
+        handshake_trace_id,
+        local_engine_id,
+        remote_engine_id
+    );
+    Ok(())
+}
 
 impl RdmaRemoteBuffer {
     /// Push data from local memory into this remote buffer (local->remote).
@@ -74,22 +165,33 @@ impl RdmaRemoteBuffer {
     #[cfg(feature = "hixl")]
     pub async fn write_from_local(
         &self,
-        _client: &(impl context::Actor + Send + Sync),
+        client: &(impl context::Actor + Send + Sync),
         local: Arc<dyn RdmaLocalMemory>,
         timeout: u64,
     ) -> Result<bool, anyhow::Error> {
+        tracing::warn!("write_from_local: self.backends = {:?}", self.backends);
         let remote_hixl = self.backends.iter().find_map(|ctx| {
             if let RdmaBackendContext::Hixl(buf) = ctx { Some(buf.clone()) } else { None }
         }).ok_or_else(|| anyhow::anyhow!("No HIXL backend on remote buffer"))?;
+        tracing::warn!("write_from_local: remote_hixl = {:?}", remote_hixl);
 
-        crate::backend::hixl::manager_actor::hixl_transfer_sync(
+        let timeout_ms = timeout as i32 * 1000;
+        ensure_bidir_connected(client, &self.owner, &remote_hixl.engine_id, timeout_ms).await?;
+
+        crate::backend::hixl::manager_actor::hixl_register_transfer_memory(
+            local.addr(),
+            local.size(),
+        )?;
+        let transfer_result = crate::backend::hixl::manager_actor::hixl_transfer_connected(
             &remote_hixl.engine_id,
             local.addr(),
             local.size(),
             remote_hixl.addr,
             hixl_sys::HixlTransferOp::HIXL_WRITE,
-            timeout as i32 * 1000,
-        )?;
+            timeout_ms,
+        );
+        crate::backend::hixl::manager_actor::hixl_deregister_transfer_memory(local.addr())?;
+        transfer_result?;
         Ok(true)
     }
 
@@ -120,22 +222,33 @@ impl RdmaRemoteBuffer {
     #[cfg(feature = "hixl")]
     pub async fn read_into_local(
         &self,
-        _client: &(impl context::Actor + Send + Sync),
+        client: &(impl context::Actor + Send + Sync),
         local: Arc<dyn RdmaLocalMemory>,
         timeout: u64,
     ) -> Result<bool, anyhow::Error> {
+        tracing::warn!("read_into_local: self.backends = {:?}", self.backends);
         let remote_hixl = self.backends.iter().find_map(|ctx| {
             if let RdmaBackendContext::Hixl(buf) = ctx { Some(buf.clone()) } else { None }
         }).ok_or_else(|| anyhow::anyhow!("No HIXL backend on remote buffer"))?;
+        tracing::warn!("read_into_local: remote_hixl = {:?}", remote_hixl);
 
-        crate::backend::hixl::manager_actor::hixl_transfer_sync(
+        let timeout_ms = timeout as i32 * 1000;
+        ensure_bidir_connected(client, &self.owner, &remote_hixl.engine_id, timeout_ms).await?;
+
+        crate::backend::hixl::manager_actor::hixl_register_transfer_memory(
+            local.addr(),
+            local.size(),
+        )?;
+        let transfer_result = crate::backend::hixl::manager_actor::hixl_transfer_connected(
             &remote_hixl.engine_id,
             local.addr(),
             local.size(),
             remote_hixl.addr,
             hixl_sys::HixlTransferOp::HIXL_READ,
-            timeout as i32 * 1000,
-        )?;
+            timeout_ms,
+        );
+        crate::backend::hixl::manager_actor::hixl_deregister_transfer_memory(local.addr())?;
+        transfer_result?;
         Ok(true)
     }
 

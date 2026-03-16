@@ -29,6 +29,19 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 
 // ============================================================================
+// HIXL Option Constants (from hixl_types.h)
+// ============================================================================
+
+/// Enable automatic connection establishment.
+/// When set to "1", the passive side will automatically establish a connection
+/// when the active side initiates TransferSync, without needing explicit Connect().
+pub const HIXL_OPTION_AUTO_CONNECT: &str = "AutoConnect";
+
+/// Buffer pool configuration.
+/// Format: "device_id:pool_size" or "0:0" for default.
+pub const HIXL_OPTION_BUFFER_POOL: &str = "BufferPool";
+
+// ============================================================================
 // Manual FFI declarations for functions not in generated bindings
 // ============================================================================
 

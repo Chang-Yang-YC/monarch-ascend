@@ -12,6 +12,11 @@
 // Wraps the C++ hixl::Hixl class into flat extern "C" functions that Rust
 // can call via FFI.  The bridge is compiled against the real HIXL headers
 // and linked against libcann_hixl.so at runtime (dlopen).
+//
+// Key design (following ref_monarch approach):
+// 1. Each HixlContext stores the ACL context from initialization
+// 2. Before every HIXL call, we restore the ACL context via aclrtSetCurrentContext
+// 3. This enables safe multi-threaded access from Rust/Python
 
 #include "bridge.h"
 #include <dlfcn.h>
@@ -21,6 +26,23 @@
 #include <map>
 #include <vector>
 #include <unistd.h>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <pthread.h>
+
+// Helper function to get current timestamp as string
+static std::string timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&t), "%H:%M:%S") << "." << std::setfill('0') << std::setw(3) << ms.count();
+    return ss.str();
+}
+
+#define TS_LOG() std::cerr << "[" << timestamp() << "] [HIXL-SYS] " << std::flush
 
 // Forward-declare hixl types only if the real headers are available.
 // We dlopen libcann_hixl.so at runtime to avoid a hard link-time dependency.
@@ -52,6 +74,25 @@
 #define HIXL_HEADERS_AVAILABLE 0
 #endif
 
+// ============================================================================
+// Internal context structure (following ref_monarch approach)
+// ============================================================================
+// The HixlContext wraps the HIXL engine with its associated ACL context.
+// This enables safe multi-threaded access by restoring the ACL context
+// before each HIXL operation.
+
+#if HIXL_HEADERS_AVAILABLE
+
+struct HixlContext {
+    hixl::Hixl* engine = nullptr;
+#if ACL_AVAILABLE
+    aclrtContext acl_ctx = nullptr;
+#endif
+    int device_id = -1;
+};
+
+#endif
+
 #if HIXL_HEADERS_AVAILABLE
 
 // ============================================================================
@@ -76,11 +117,62 @@ static HixlTransferStatus from_transfer_status(hixl::TransferStatus s) {
     }
 }
 
+// ============================================================================
+// ACL Context Management (following ref_monarch approach)
+// ============================================================================
+
+#if ACL_AVAILABLE
+/// Restore the ACL context for the current thread.
+/// This is called before every HIXL operation to ensure thread safety.
+/// ACL runtime uses thread-local state, so we must restore the context
+/// when calling from a different thread than the one that initialized HIXL.
+static void restore_acl_context(aclrtContext ctx) {
+    if (ctx != nullptr) {
+        aclError ret = aclrtSetCurrentContext(ctx);
+        if (ret != 0) {
+            std::cerr << "[HIXL-SYS] WARNING: aclrtSetCurrentContext failed: " << ret << std::endl;
+        }
+    }
+}
+#else
+static void restore_acl_context(void* ctx) {
+    (void)ctx;
+}
+#endif
+
+/// Get the current ACL context (for debugging)
+static void* get_current_acl_context() {
+#if ACL_AVAILABLE
+    aclrtContext ctx = nullptr;
+    aclrtGetCurrentContext(&ctx);
+    return ctx;
+#else
+    return nullptr;
+#endif
+}
+
 extern "C" {
 
 HixlHandle HixlCreate(void) {
     try {
-        return static_cast<HixlHandle>(new hixl::Hixl());
+        auto* ctx = new HixlContext();
+        ctx->engine = new hixl::Hixl();
+        
+#if ACL_AVAILABLE
+        // Save the current ACL context at creation time.
+        // This is critical for multi-threaded access — we'll restore it
+        // before every HIXL call.
+        aclrtGetCurrentContext(&ctx->acl_ctx);
+        
+        // Also record the device ID
+        aclrtGetDevice(&ctx->device_id);
+        
+        TS_LOG() << "HixlCreate: engine created, acl_ctx=" << ctx->acl_ctx
+                  << " device=" << ctx->device_id
+                  << " tid=" << pthread_self() << std::endl;
+#endif
+        
+        return static_cast<HixlHandle>(ctx);
     } catch (const std::exception &e) {
         std::cerr << "[HIXL-SYS] HixlCreate failed: " << e.what() << std::endl;
         return nullptr;
@@ -88,60 +180,17 @@ HixlHandle HixlCreate(void) {
 }
 
 void HixlDestroy(HixlHandle handle) {
-    delete static_cast<hixl::Hixl *>(handle);
-}
-
-// Ensure ACL runtime is initialized with a device context.
-// HIXL requires the ACL device context to be active.
-//
-// This function respects the device set by torch_npu/torch.npu.set_device()
-// and falls back to MONARCH_NPU_DEVICE or ASCEND_RT_VISIBLE_DEVICES env vars.
-static bool ensure_acl_device() {
+    if (!handle) return;
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
 #if ACL_AVAILABLE
-    static thread_local bool initialized = false;
-    if (initialized) return true;
-
-    // torch_npu already initialized ACL; skip aclInit to avoid state corruption.
-    // We only need to ensure the correct device is set for this thread.
-
-    // First, check if a device is already set (by torch_npu)
-    int32_t current_dev = -1;
-    aclError ret = aclrtGetDevice(&current_dev);
-    if (ret == 0 && current_dev >= 0) {
-        // Device already set by Python/torch_npu
-        std::cerr << "[HIXL-SYS] ensure_acl_device: using existing device " << current_dev
-                  << " (pid=" << getpid() << ")" << std::endl;
-        initialized = true;
-        return true;
-    }
-
-    // No device set, determine from environment variables
-    int target_dev = 0;
-    const char* npu_dev = getenv("MONARCH_NPU_DEVICE");
-    if (npu_dev) {
-        target_dev = atoi(npu_dev);
-    } else {
-        const char* vis = getenv("ASCEND_RT_VISIBLE_DEVICES");
-        if (vis) {
-            target_dev = atoi(vis);
-        }
-    }
-
-    ret = aclrtSetDevice(target_dev);
-    if (ret != 0) {
-        std::cerr << "[HIXL-SYS] aclrtSetDevice(" << target_dev << ") failed: " << ret << std::endl;
-        return false;
-    }
-
-    int32_t final_dev = -1;
-    aclrtGetDevice(&final_dev);
-    std::cerr << "[HIXL-SYS] ensure_acl_device: using device " << final_dev
-              << " (pid=" << getpid() << ")" << std::endl;
-    initialized = true;
-    return true;
-#else
-    return true;
+    restore_acl_context(ctx->acl_ctx);
 #endif
+    
+    if (ctx->engine) {
+        delete ctx->engine;
+    }
+    delete ctx;
 }
 
 HixlStatus HixlInitialize(HixlHandle handle,
@@ -150,71 +199,137 @@ HixlStatus HixlInitialize(HixlHandle handle,
                            size_t num_options) {
     if (!handle || !local_engine) return HIXL_PARAM_INVALID;
 
-    if (!ensure_acl_device()) {
-        std::cerr << "[HIXL-SYS] ACL device setup failed, HIXL Initialize may fail" << std::endl;
-    }
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation (ref_monarch pattern)
+    restore_acl_context(ctx->acl_ctx);
 
-    auto *h = static_cast<hixl::Hixl *>(handle);
+    TS_LOG() << "Initialize START: engine=" << local_engine 
+              << " pid=" << getpid()
+              << " tid=" << pthread_self()
+              << " acl_ctx=" << get_current_acl_context() << std::endl;
+
     std::map<hixl::AscendString, hixl::AscendString> opts;
     for (size_t i = 0; i < num_options; ++i) {
         if (options[i].key && options[i].value)
             opts[hixl::AscendString(options[i].key)] =
                 hixl::AscendString(options[i].value);
     }
-    return h->Initialize(hixl::AscendString(local_engine), opts);
+    
+    HixlStatus status = ctx->engine->Initialize(hixl::AscendString(local_engine), opts);
+    
+    TS_LOG() << "Initialize END: engine=" << local_engine << " status=" << status << std::endl;
+    return status;
 }
 
 void HixlFinalize(HixlHandle handle) {
-    if (handle) static_cast<hixl::Hixl *>(handle)->Finalize();
+    if (!handle) return;
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
+    ctx->engine->Finalize();
 }
 
 HixlStatus HixlRegisterMem(HixlHandle handle, uintptr_t addr, size_t len,
                             HixlMemType mem_type, HixlMemHandle *out) {
     if (!handle || !out) return HIXL_PARAM_INVALID;
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
+    // Check 2MB alignment for HCCS mode
+    constexpr size_t HCCS_ALIGN = 2UL * 1024 * 1024;
+    if (addr % HCCS_ALIGN != 0) {
+        TS_LOG() << "WARNING: addr=" << (void*)addr << " is NOT 2MB-aligned"
+                  << " (offset=" << (addr % HCCS_ALIGN) << ")"
+                  << " — HCCS transfers may fail" << std::endl;
+    }
+    
     hixl::MemDesc mem{}; mem.addr = addr; mem.len = len;
     hixl::MemHandle mh = nullptr;
-    auto s = static_cast<hixl::Hixl *>(handle)->RegisterMem(
-        mem, to_mem_type(mem_type), mh);
+    auto s = ctx->engine->RegisterMem(mem, to_mem_type(mem_type), mh);
     *out = mh;
+    
+    TS_LOG() << "RegisterMem: addr=" << (void*)addr << " len=" << len
+              << " status=" << s << " tid=" << pthread_self() << std::endl;
     return s;
 }
 
 HixlStatus HixlDeregisterMem(HixlHandle handle, HixlMemHandle mh) {
     if (!handle) return HIXL_PARAM_INVALID;
-    return static_cast<hixl::Hixl *>(handle)->DeregisterMem(mh);
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
+    return ctx->engine->DeregisterMem(mh);
 }
 
 HixlStatus HixlConnect(HixlHandle handle, const char *remote, int32_t timeout) {
     if (!handle || !remote) return HIXL_PARAM_INVALID;
-    return static_cast<hixl::Hixl *>(handle)->Connect(
-        hixl::AscendString(remote), timeout);
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
+    TS_LOG() << "Connect START: remote=" << remote
+              << " timeout=" << timeout << "ms"
+              << " pid=" << getpid()
+              << " tid=" << pthread_self() << std::endl;
+    
+    HixlStatus status = ctx->engine->Connect(hixl::AscendString(remote), timeout);
+    
+    TS_LOG() << "Connect END: remote=" << remote << " status=" << status << std::endl;
+    
+    // Log ACL error if connect failed
+    if (status != 0) {
+#if ACL_AVAILABLE
+        const char* err = aclGetRecentErrMsg();
+        TS_LOG() << "Connect ACL error: " << (err ? err : "none") << std::endl;
+#endif
+    }
+    
+    return status;
 }
 
 HixlStatus HixlDisconnect(HixlHandle handle, const char *remote, int32_t timeout) {
     if (!handle || !remote) return HIXL_PARAM_INVALID;
-    return static_cast<hixl::Hixl *>(handle)->Disconnect(
-        hixl::AscendString(remote), timeout);
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
+    return ctx->engine->Disconnect(hixl::AscendString(remote), timeout);
 }
 
 HixlStatus HixlTransferSync(HixlHandle handle, const char *remote,
                              HixlTransferOp op, const HixlTransferOpDesc *descs,
                              size_t n, int32_t timeout) {
     if (!handle || !remote) return HIXL_PARAM_INVALID;
-    if (!ensure_acl_device()) {
-        std::cerr << "[HIXL-SYS] TransferSync: ACL device setup failed" << std::endl;
-    }
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation (CRITICAL for thread safety)
+    restore_acl_context(ctx->acl_ctx);
 
-    // Debug output
-    std::cerr << "[HIXL-SYS] TransferSync handle=" << handle
-              << " remote='" << remote << "'"
+    TS_LOG() << "TransferSync START: remote='" << remote << "'"
               << " op=" << (int)op << " n=" << n
-              << " timeout=" << timeout << " pid=" << getpid() << std::endl;
+              << " timeout=" << timeout
+              << " pid=" << getpid()
+              << " tid=" << pthread_self()
+              << " acl_ctx=" << get_current_acl_context() << std::endl;
     for (size_t i = 0; i < n; ++i) {
-        std::cerr << "[HIXL-SYS]   [" << i << "] local=" << (void*)descs[i].local_addr
+        TS_LOG() << "  [" << i << "] local=" << (void*)descs[i].local_addr
                   << " remote=" << (void*)descs[i].remote_addr
                   << " len=" << descs[i].len << std::endl;
     }
-    std::cerr.flush();
 
     std::vector<hixl::TransferOpDesc> v(n);
     for (size_t i = 0; i < n; ++i) {
@@ -222,12 +337,20 @@ HixlStatus HixlTransferSync(HixlHandle handle, const char *remote,
         v[i].remote_addr = descs[i].remote_addr;
         v[i].len = descs[i].len;
     }
-    auto s = static_cast<hixl::Hixl *>(handle)->TransferSync(
+    
+    auto s = ctx->engine->TransferSync(
         hixl::AscendString(remote), to_transfer_op(op), v, timeout);
     
-    const char* err = aclGetRecentErrMsg();
-    std::cerr << "[HIXL-SYS] TransferSync result=" << s 
-              << " err=" << (err ? err : "none") << std::endl;
+    TS_LOG() << "TransferSync END: status=" << s << std::endl;
+    
+    // Log ACL error if transfer failed
+    if (s != 0) {
+#if ACL_AVAILABLE
+        const char* err = aclGetRecentErrMsg();
+        TS_LOG() << "TransferSync ACL error: " << (err ? err : "none") << std::endl;
+#endif
+    }
+    
     return s;
 }
 
@@ -235,6 +358,12 @@ HixlStatus HixlTransferAsync(HixlHandle handle, const char *remote,
                               HixlTransferOp op, const HixlTransferOpDesc *descs,
                               size_t n, HixlTransferReq *out) {
     if (!handle || !remote || !out) return HIXL_PARAM_INVALID;
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
     std::vector<hixl::TransferOpDesc> v(n);
     for (size_t i = 0; i < n; ++i) {
         v[i].local_addr = descs[i].local_addr;
@@ -243,7 +372,7 @@ HixlStatus HixlTransferAsync(HixlHandle handle, const char *remote,
     }
     hixl::TransferArgs args{};
     hixl::TransferReq req = nullptr;
-    auto s = static_cast<hixl::Hixl *>(handle)->TransferAsync(
+    auto s = ctx->engine->TransferAsync(
         hixl::AscendString(remote), to_transfer_op(op), v, args, req);
     *out = req;
     return s;
@@ -252,8 +381,14 @@ HixlStatus HixlTransferAsync(HixlHandle handle, const char *remote,
 HixlStatus HixlGetTransferStatus(HixlHandle handle, HixlTransferReq req,
                                   HixlTransferStatus *out) {
     if (!handle || !out) return HIXL_PARAM_INVALID;
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
     hixl::TransferStatus st;
-    auto s = static_cast<hixl::Hixl *>(handle)->GetTransferStatus(req, st);
+    auto s = ctx->engine->GetTransferStatus(req, st);
     *out = from_transfer_status(st);
     return s;
 }
@@ -261,19 +396,30 @@ HixlStatus HixlGetTransferStatus(HixlHandle handle, HixlTransferReq req,
 HixlStatus HixlSendNotify(HixlHandle handle, const char *remote,
                            const char *name, const char *msg, int32_t timeout) {
     if (!handle || !remote) return HIXL_PARAM_INVALID;
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
     hixl::NotifyDesc nd;
     nd.name = hixl::AscendString(name ? name : "");
     nd.notify_msg = hixl::AscendString(msg ? msg : "");
-    return static_cast<hixl::Hixl *>(handle)->SendNotify(
-        hixl::AscendString(remote), nd, timeout);
+    return ctx->engine->SendNotify(hixl::AscendString(remote), nd, timeout);
 }
 
 HixlStatus HixlGetNotifies(HixlHandle handle,
                             void (*cb)(const char *, const char *, void *),
                             void *ud) {
     if (!handle || !cb) return HIXL_PARAM_INVALID;
+    
+    auto* ctx = static_cast<HixlContext*>(handle);
+    
+    // Restore ACL context before operation
+    restore_acl_context(ctx->acl_ctx);
+    
     std::vector<hixl::NotifyDesc> notifies;
-    auto s = static_cast<hixl::Hixl *>(handle)->GetNotifies(notifies);
+    auto s = ctx->engine->GetNotifies(notifies);
     if (s == hixl::SUCCESS) {
         for (const auto &n : notifies)
             cb(n.name.GetString(), n.notify_msg.GetString(), ud);
@@ -321,6 +467,18 @@ int32_t HixlGetAclDevice(void) {
 #endif
 }
 
+/// Get the saved ACL context from a HixlHandle (for debugging)
+uintptr_t HixlGetSavedAclContext(HixlHandle handle) {
+#if ACL_AVAILABLE
+    if (!handle) return 0;
+    auto* ctx = static_cast<HixlContext*>(handle);
+    return reinterpret_cast<uintptr_t>(ctx->acl_ctx);
+#else
+    (void)handle;
+    return 0;
+#endif
+}
+
 } // extern "C"
 
 #else // !HIXL_HEADERS_AVAILABLE
@@ -363,6 +521,7 @@ const char *HixlGetStatusString(HixlStatus status) {
 
 int32_t HixlSetAclDevice(int32_t) { return -3; }
 int32_t HixlGetAclDevice(void) { return -3; }
+uintptr_t HixlGetSavedAclContext(HixlHandle) { return 0; }
 
 } // extern "C"
 

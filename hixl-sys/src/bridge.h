@@ -153,6 +153,10 @@ int32_t HixlSetAclDevice(int32_t device_id);
 /// Returns -1 if no device is set, -3 if ACL not available.
 int32_t HixlGetAclDevice(void);
 
+/// Get the saved ACL context from a HixlHandle (for debugging).
+/// Returns 0 if handle is null or ACL not available.
+uintptr_t HixlGetSavedAclContext(HixlHandle handle);
+
 #ifdef __cplusplus
 }
 #endif

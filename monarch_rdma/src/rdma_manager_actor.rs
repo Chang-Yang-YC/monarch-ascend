@@ -28,6 +28,8 @@
 //! - Handles remote [`ReleaseBuffer`] requests to clean up registrations.
 
 use std::collections::HashMap;
+#[cfg(feature = "hixl")]
+use std::fs;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,7 +71,6 @@ use crate::backend::ibverbs::primitives::IbvConfig;
 use crate::backend::hixl::manager_actor::HixlManagerActor;
 #[cfg(feature = "hixl")]
 use crate::backend::hixl::manager_actor::HixlManagerMessageClient;
-
 /// Helper function to get detailed error messages from RDMAXCEL error codes.
 #[cfg(not(feature = "hixl"))]
 pub fn get_rdmaxcel_error_message(error_code: i32) -> String {
@@ -112,6 +113,18 @@ pub struct ReleaseBuffer {
     pub id: usize,
 }
 wirevalue::register_type!(ReleaseBuffer);
+
+/// Serializable cross-process message asking the receiver to establish
+/// an HIXL connection to the given peer engine id.
+#[cfg(feature = "hixl")]
+#[derive(Handler, HandleClient, RefClient, Debug, Serialize, Deserialize, Named)]
+pub struct EnsurePeerConnected {
+    pub peer_engine_id: String,
+    #[reply]
+    pub reply: OncePortRef<()>,
+}
+#[cfg(feature = "hixl")]
+wirevalue::register_type!(EnsurePeerConnected);
 
 /// Serializable query for resolving the [`IbvManagerActor`] ref
 /// from a remote [`RdmaManagerActor`]. Only used in testing.
@@ -284,6 +297,7 @@ impl RdmaManagerMessageHandler for RdmaManagerActor {
 #[hyperactor::export(
     spawn = true,
     handlers = [
+        EnsurePeerConnected,
         ReleaseBuffer,
     ],
 )]
@@ -423,23 +437,94 @@ fn allocate_hixl_port(configured_port: Option<u16>) -> u16 {
 }
 
 
+#[cfg(feature = "hixl")]
+fn npu_device_id_from_env() -> Option<u32> {
+    if let Ok(v) = std::env::var("MONARCH_NPU_DEVICE") {
+        if let Ok(id) = v.trim().parse::<u32>() {
+            return Some(id);
+        }
+    }
+
+    if let Ok(v) = std::env::var("ASCEND_RT_VISIBLE_DEVICES") {
+        let first = v.split(',').next().unwrap_or("").trim();
+        if let Ok(id) = first.parse::<u32>() {
+            return Some(id);
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "hixl")]
+fn read_device_ip_from_hccn_conf(device_id: u32) -> Option<String> {
+    let mut conf_paths: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("HCCN_CONF_PATH") {
+        if !p.trim().is_empty() {
+            conf_paths.push(p);
+        }
+    }
+    conf_paths.push("/etc/hccn.conf".to_string());
+
+    let key = format!("address_{}=", device_id);
+    for path in conf_paths {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(ip) = line.strip_prefix(&key) {
+                let ip = ip.trim();
+                if !ip.is_empty() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+
 
 #[cfg(feature = "hixl")]
 
 pub(crate) fn local_ip_for_hixl() -> String {
-    // Try to get a non-loopback IPv4 address
+    // 1) Explicit override for engine_id IP.
+    if let Ok(ip) = std::env::var("MONARCH_HIXL_IP") {
+        let ip = ip.trim();
+        if !ip.is_empty() {
+            tracing::info!("HIXL: using MONARCH_HIXL_IP={}", ip);
+            return ip.to_string();
+        }
+    }
+
+    // 2) Use host non-loopback IPv4 for HIXL engine_id.
+    // NOTE: HIXL engine_id should use HOST IP (not device IP) for RoCE communication.
+    // The device IP is used internally by HCCL for HCCS communication, but HIXL's
+    // server-server model requires host IP for the listening socket.
     if let Ok(hostname) = hostname::get() {
         if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(
             &format!("{}:0", hostname.to_string_lossy()),
         ) {
             for addr in addrs {
                 if addr.is_ipv4() && !addr.ip().is_loopback() {
+                    tracing::info!(
+                        "HIXL: using host IPv4 for engine_id ip={}",
+                        addr.ip()
+                    );
                     return addr.ip().to_string();
                 }
             }
         }
     }
     // Fallback: use 0.0.0.0 (binds to all interfaces)
+    tracing::warn!(
+        "HIXL: fallback to 0.0.0.0 for engine_id (unable to resolve host ip)"
+    );
     "0.0.0.0".to_string()
 }
 #[cfg(feature = "hixl")]
@@ -504,6 +589,55 @@ impl ReleaseBufferHandler for RdmaManagerActor {
 
 #[cfg(feature = "hixl")]
 #[async_trait]
+#[hyperactor::handle(EnsurePeerConnected)]
+impl EnsurePeerConnectedHandler for RdmaManagerActor {
+    async fn ensure_peer_connected(
+        &mut self,
+        _cx: &Context<Self>,
+        peer_engine_id: String,
+    ) -> Result<(), anyhow::Error> {
+        let timeout_ms = std::env::var("MONARCH_HIXL_CONNECT_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(20_000);
+        let local_engine_id = crate::backend::hixl::manager_actor::get_engine_id()
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::warn!(
+            "RdmaManager: ensure_peer_connected start peer={} local_engine={} timeout_ms={} acl_device={:?}",
+            peer_engine_id,
+            local_engine_id,
+            timeout_ms,
+            hixl_sys::get_acl_device(),
+        );
+        let connect_result =
+            crate::backend::hixl::manager_actor::hixl_connect_peer(&peer_engine_id, timeout_ms);
+        match connect_result {
+            Ok(()) => {
+                tracing::warn!(
+                    "RdmaManager: ensure_peer_connected done peer={} local_engine={} acl_device={:?}",
+                    peer_engine_id,
+                    local_engine_id,
+                    hixl_sys::get_acl_device(),
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    "RdmaManager: ensure_peer_connected failed peer={} local_engine={} timeout_ms={} acl_device={:?} err={}",
+                    peer_engine_id,
+                    local_engine_id,
+                    timeout_ms,
+                    hixl_sys::get_acl_device(),
+                    e,
+                );
+                Err(e)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "hixl")]
+#[async_trait]
 #[hyperactor::handle(RdmaManagerMessage)]
 impl RdmaManagerMessageHandler for RdmaManagerActor {
     async fn request_buffer(
@@ -520,7 +654,21 @@ impl RdmaManagerMessageHandler for RdmaManagerActor {
         self.buffers.insert(remote_buf_id, local);
 
         tracing::warn!("RdmaManager: sending to HixlManagerActor...");
-        let hixl_buf = self.hixl.handle().request_buffer(cx, remote_buf_id, addr, size).await?
+        let request_timeout_ms = std::env::var("MONARCH_HIXL_REQUEST_BUFFER_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10_000);
+        let hixl_buf = tokio::time::timeout(
+            std::time::Duration::from_millis(request_timeout_ms),
+            self.hixl.handle().request_buffer(cx, remote_buf_id, addr, size),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "HIXL request_buffer timed out after {}ms (likely HixlManagerActor init failure; check earlier HIXL initialize logs)",
+                request_timeout_ms
+            )
+        })??
             .ok_or_else(|| anyhow::anyhow!("HIXL request_buffer returned None for id {}", remote_buf_id))?;
         tracing::warn!("RdmaManager: got HixlBuffer: {:?}", hixl_buf);
 
