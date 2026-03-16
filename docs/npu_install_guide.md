@@ -276,6 +276,48 @@ buf = alloc_aligned_tensor((size,), dtype=torch.float32, device="npu:0")
 
 ---
 
+## HiXL 单边通信带宽实测
+
+测试环境：Ascend 910B1，HCCS 模式（默认），NPU 5 ↔ NPU 6，TransferSync 同步传输。
+
+测试脚本：`tests/hixl/bench_hixl_bandwidth.py`
+
+```bash
+python tests/hixl/bench_hixl_bandwidth.py 5 6
+```
+
+| 操作 | 数据量 | 带宽 (GB/s) | 延迟 (ms) |
+|------|--------|------------|-----------|
+| READ | 1 MB | 7.65 | 0.128 |
+| WRITE | 1 MB | 7.88 | 0.124 |
+| READ | 2 MB | 10.84 | 0.180 |
+| WRITE | 2 MB | 11.52 | 0.170 |
+| READ | 4 MB | 14.59 | 0.268 |
+| WRITE | 4 MB | 14.49 | 0.270 |
+| READ | 8 MB | 16.54 | 0.472 |
+| WRITE | 8 MB | 16.69 | 0.468 |
+| READ | 16 MB | 17.97 | 0.870 |
+| WRITE | 16 MB | 17.99 | 0.869 |
+| READ | 32 MB | 18.65 | 1.675 |
+| WRITE | 32 MB | 18.53 | 1.687 |
+| READ | 64 MB | 18.89 | 3.308 |
+| WRITE | 64 MB | 18.46 | 3.385 |
+| READ | 128 MB | 19.28 | 6.483 |
+| WRITE | 128 MB | 19.32 | 6.469 |
+| READ | 256 MB | 19.26 | 12.982 |
+| WRITE | 256 MB | 19.42 | 12.870 |
+| **READ** | **512 MB** | **19.45** | **25.703** |
+| **WRITE** | **512 MB** | **19.48** | **25.668** |
+
+**分析：**
+
+- 峰值带宽约 **19.5 GB/s**，128 MB 以上趋于饱和
+- READ 和 WRITE 性能对称，差异 < 1%
+- 小数据延迟优秀：1 MB 仅需 ~0.13 ms
+- 910B HCCS 单边理论带宽 ~28 GB/s，实测利用率约 **70%**（TransferSync 同步开销，异步流水线可更高）
+
+---
+
 ## 踩坑速查表
 
 | # | 现象 | 原因 | 解决 |
