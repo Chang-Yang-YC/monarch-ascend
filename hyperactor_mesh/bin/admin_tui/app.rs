@@ -19,8 +19,8 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use futures::StreamExt;
-use hyperactor::introspect::NodePayload;
-use hyperactor::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodePayload;
+use hyperactor_mesh::introspect::NodeProperties;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -38,6 +38,7 @@ use crate::VisibleRows;
 use crate::build_tree_node;
 use crate::collapse_all;
 use crate::collect_expanded_refs;
+use crate::collect_failed_refs;
 use crate::collect_refs;
 use crate::derive_label;
 use crate::diagnostics::DiagResult;
@@ -100,7 +101,7 @@ pub(crate) struct App {
 
     /// Whether to show stopped actors (toggled via `h`).
     /// Hidden by default so the tree focuses on live actors.
-    /// Failed nodes are always visible regardless of this setting.
+    /// TUI-4: failed nodes always visible.
     pub(crate) show_stopped: bool,
 
     /// Fetch cache with generation-based staleness.
@@ -278,13 +279,14 @@ impl App {
         self.error = None;
         self.refresh_gen += 1;
 
-        // Save expanded state before rebuilding.
+        // Save expanded and failed state before rebuilding.
         // Track (reference, depth) pairs to handle dual appearances correctly.
         let mut expanded_keys = HashSet::new();
+        let mut failed_keys = HashSet::new();
         if let Some(root) = self.tree() {
-            // Start at depth -1 so root's children are at depth 0
             for child in &root.children {
                 collect_expanded_refs(child, 0, &mut expanded_keys);
+                collect_failed_refs(child, 0, &mut failed_keys);
             }
         }
 
@@ -324,6 +326,7 @@ impl App {
                 child_ref,
                 0,
                 &expanded_keys,
+                &failed_keys,
                 self.refresh_gen,
                 &mut self.seq_counter,
             )
@@ -454,7 +457,7 @@ impl App {
             let child_is_stopped = stopped_children.contains(child_ref.as_str());
             let child_is_system = system_children.contains(child_ref.as_str());
 
-            // Failed nodes are always visible (never filtered by show_stopped).
+            // TUI-4: failed nodes always visible.
             // If the parent proc is poisoned, its stopped children may be
             // failed — don't filter them out (cache may be empty on first load).
             let child_is_failed = parent_is_poisoned
@@ -506,7 +509,7 @@ impl App {
                     if !self.show_system && is_system_node(&cp.properties) {
                         continue;
                     }
-                    // Apply stopped filtering (failed nodes always visible).
+                    // TUI-4: failed nodes always visible.
                     if !self.show_stopped
                         && is_stopped_node(&cp.properties)
                         && !is_failed_node(&cp.properties)

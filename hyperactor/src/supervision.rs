@@ -14,24 +14,21 @@ use std::fmt::Write;
 use std::time::SystemTime;
 
 use derivative::Derivative;
-use hyperactor::clock::Clock;
-use hyperactor::clock::RealClock;
 use hyperactor_config::Flattrs;
 use indenter::indented;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate as hyperactor; // for macros
 use crate::actor::ActorErrorKind;
 use crate::actor::ActorStatus;
-use crate::reference::ActorId;
+use crate::reference;
 
 /// This is the local actor supervision event. Child actor will propagate this event to its parent.
 #[derive(Clone, Debug, Derivative, Serialize, Deserialize, typeuri::Named)]
 #[derivative(PartialEq, Eq)]
 pub struct ActorSupervisionEvent {
     /// The actor id of the child actor where the event is triggered.
-    pub actor_id: ActorId,
+    pub actor_id: reference::ActorId,
     /// Friendly display name, if the actor class customized it.
     pub display_name: Option<String>,
     /// The time when the event is triggered.
@@ -48,7 +45,7 @@ wirevalue::register_type!(ActorSupervisionEvent);
 impl ActorSupervisionEvent {
     /// Create a new supervision event. Timestamp is set to the current time.
     pub fn new(
-        actor_id: ActorId,
+        actor_id: reference::ActorId,
         display_name: Option<String>,
         actor_status: ActorStatus,
         message_headers: Option<Flattrs>,
@@ -56,7 +53,7 @@ impl ActorSupervisionEvent {
         Self {
             actor_id,
             display_name,
-            occurred_at: RealClock.system_time_now(),
+            occurred_at: std::time::SystemTime::now(),
             actor_status,
             message_headers,
         }
@@ -89,7 +86,7 @@ impl ActorSupervisionEvent {
 impl std::error::Error for ActorSupervisionEvent {}
 
 fn fmt_status<'a>(
-    actor_id: &ActorId,
+    actor_id: &reference::ActorId,
     status: &'a ActorStatus,
     f: &mut fmt::Formatter<'_>,
 ) -> Result<Option<&'a ActorSupervisionEvent>, fmt::Error> {

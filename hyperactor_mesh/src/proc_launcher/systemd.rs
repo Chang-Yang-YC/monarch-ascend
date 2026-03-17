@@ -71,10 +71,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use hyperactor::ProcId;
 use hyperactor::channel::ChannelAddr;
-use hyperactor::clock::Clock;
-use hyperactor::clock::RealClock;
+use hyperactor::reference as hyperactor_reference;
 use tokio::sync::oneshot;
 use tracing::Instrument;
 use zbus::Connection;
@@ -149,8 +147,8 @@ fn is_unit_gone(e: &zbus::Error) -> bool {
 /// it), we log a warning and recover the guard anyway. This ensures
 /// cleanup can proceed even after a panic.
 fn units_lock_recover(
-    units: &std::sync::Mutex<HashMap<ProcId, String>>,
-) -> MutexGuard<'_, HashMap<ProcId, String>> {
+    units: &std::sync::Mutex<HashMap<hyperactor_reference::ProcId, String>>,
+) -> MutexGuard<'_, HashMap<hyperactor_reference::ProcId, String>> {
     units.lock().unwrap_or_else(|p| {
         tracing::warn!("mutex was poisoned, recovering");
         p.into_inner()
@@ -264,8 +262,8 @@ fn is_terminal(active: &str, sub: &str) -> bool {
 /// Log exit, remove proc from units map, and send result on channel.
 fn send_and_cleanup(
     kind: ProcExitKind,
-    proc_id: &ProcId,
-    units: &std::sync::Mutex<HashMap<ProcId, String>>,
+    proc_id: &hyperactor_reference::ProcId,
+    units: &std::sync::Mutex<HashMap<hyperactor_reference::ProcId, String>>,
     exit_tx: oneshot::Sender<ProcExitResult>,
 ) {
     tracing::debug!(?kind, "exit_observed");
@@ -398,8 +396,8 @@ fn map_exit_from_result(result: &str, status: i32, active: &str, sub: &str) -> P
 /// 7. Sends the result on `exit_tx`
 async fn monitor_exit(
     conn: Connection,
-    units: Arc<std::sync::Mutex<HashMap<ProcId, String>>>,
-    proc_id: ProcId,
+    units: Arc<std::sync::Mutex<HashMap<hyperactor_reference::ProcId, String>>>,
+    proc_id: hyperactor_reference::ProcId,
     handle: SystemdUnitHandle,
     exit_tx: oneshot::Sender<ProcExitResult>,
 ) {
@@ -577,7 +575,7 @@ async fn monitor_exit(
             break;
         }
 
-        RealClock.sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     // Map exit to ProcExitKind using the helper function.
@@ -666,7 +664,7 @@ pub(crate) struct SystemdProcLauncher {
     ///
     /// Uses `std::sync::Mutex` (not tokio) so Drop can synchronously
     /// acquire the lock.
-    units: Arc<std::sync::Mutex<HashMap<ProcId, String>>>,
+    units: Arc<std::sync::Mutex<HashMap<hyperactor_reference::ProcId, String>>>,
 }
 
 impl SystemdProcLauncher {
@@ -712,7 +710,7 @@ impl SystemdProcLauncher {
     ///   unit names (hex encoding is collision-free on bytes).
     /// - **Systemd-safe**: output contains only ASCII hex digits plus
     ///   `-` and `.service`.
-    pub(crate) fn unit_name(proc_id: &ProcId) -> String {
+    pub(crate) fn unit_name(proc_id: &hyperactor_reference::ProcId) -> String {
         // Hex-encode the ProcId string to ensure only valid systemd
         // unit name characters. This is bijective (collision-free)
         // and stable.
@@ -782,7 +780,7 @@ impl SystemdProcLauncher {
 
     /// Build the properties for `StartTransientUnit`.
     fn build_unit_props<'a>(
-        proc_id: &ProcId,
+        proc_id: &hyperactor_reference::ProcId,
         exec_start: Vec<(String, Vec<String>, bool)>,
         env_kv: Vec<String>,
     ) -> Vec<(&'a str, Value<'a>)> {
@@ -807,7 +805,11 @@ impl SystemdProcLauncher {
     }
 
     /// Shared implementation for terminate/kill via systemd StopUnit.
-    async fn stop_unit_impl(&self, proc_id: &ProcId, op: StopOp) -> Result<(), ProcLauncherError> {
+    async fn stop_unit_impl(
+        &self,
+        proc_id: &hyperactor_reference::ProcId,
+        op: StopOp,
+    ) -> Result<(), ProcLauncherError> {
         let unit = match self.units.lock().unwrap().get(proc_id).cloned() {
             Some(u) => u,
             None => {
@@ -906,7 +908,7 @@ impl ProcLauncher for SystemdProcLauncher {
     )]
     async fn launch(
         &self,
-        proc_id: &ProcId,
+        proc_id: &hyperactor_reference::ProcId,
         opts: LaunchOptions,
     ) -> Result<LaunchResult, ProcLauncherError> {
         let unit = Self::unit_name(proc_id);
@@ -934,7 +936,7 @@ impl ProcLauncher for SystemdProcLauncher {
                 )))
             })?;
 
-        let started_at = hyperactor::clock::RealClock.system_time_now();
+        let started_at = std::time::SystemTime::now();
 
         tracing::debug!("spawned");
 
@@ -987,7 +989,7 @@ impl ProcLauncher for SystemdProcLauncher {
     ///   from the `units` map when observed.
     async fn terminate(
         &self,
-        proc_id: &ProcId,
+        proc_id: &hyperactor_reference::ProcId,
         timeout: Duration,
     ) -> Result<(), ProcLauncherError> {
         self.stop_unit_impl(proc_id, StopOp::Terminate { timeout })
@@ -1008,7 +1010,7 @@ impl ProcLauncher for SystemdProcLauncher {
     /// - The exit monitor is responsible for observing the final exit
     ///   status (Exited vs Signaled) and for removing the proc from
     ///   the `units` map.
-    async fn kill(&self, proc_id: &ProcId) -> Result<(), ProcLauncherError> {
+    async fn kill(&self, proc_id: &hyperactor_reference::ProcId) -> Result<(), ProcLauncherError> {
         self.stop_unit_impl(proc_id, StopOp::Kill).await
     }
 }
@@ -1022,7 +1024,7 @@ impl Drop for SystemdProcLauncher {
         // Note: This cleanup is best-effort. If the process is
         // terminating, the spawned cleanup thread may not complete
         // before the process exits.
-        let units: Vec<(ProcId, String)> = {
+        let units: Vec<(hyperactor_reference::ProcId, String)> = {
             let mut guard = units_lock_recover(&self.units);
             guard.drain().collect()
         };
@@ -1097,8 +1099,6 @@ mod tests {
 
     use hyperactor::channel::ChannelAddr;
     use hyperactor::channel::ChannelTransport;
-    use hyperactor::clock::Clock;
-    use hyperactor::clock::RealClock;
     use hyperactor::testing::ids::test_proc_id;
 
     use super::*;
@@ -1154,8 +1154,7 @@ mod tests {
             "{}/monarch-env-vars-{}-{}.txt",
             runtime_dir,
             std::process::id(),
-            RealClock
-                .system_time_now()
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
@@ -1191,7 +1190,7 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let proc_id = ProcId(any_unix_addr(), "env-vars".into());
+        let proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "env-vars");
         // v0 bootstrap by default but it doesn't matter here.
         let bootstrap = Bootstrap::default();
         let opts = LaunchOptions {
@@ -1201,6 +1200,7 @@ mod tests {
             want_stdio: true,
             tail_lines: 0,
             log_channel: Some(log_channel.clone()),
+            proc_bind: None,
         };
 
         let lr = launcher.launch(&proc_id, opts).await.expect("launch");
@@ -1216,8 +1216,7 @@ mod tests {
         );
 
         // Wait for exit
-        let exit = RealClock
-            .timeout(Duration::from_secs(5), lr.exit_rx)
+        let exit = tokio::time::timeout(Duration::from_secs(5), lr.exit_rx)
             .await
             .expect("timed out waiting for exit_rx")
             .expect("exit_rx dropped");
@@ -1249,14 +1248,14 @@ mod tests {
             "env-safe encoding should be deterministic/stable"
         );
 
-        // Process name includes "proc " prefix and the proc name
+        // Process name includes the proc name and " @ " separator
         assert!(
-            proc_name_env.starts_with("proc "),
+            proc_name_env.starts_with("env-vars"),
             "PROCESS_NAME_ENV looks wrong: {proc_name_env:?}"
         );
         assert!(
-            proc_name_env.contains("env-vars"),
-            "expected proc name in process name: {proc_name_env:?}"
+            proc_name_env.contains(" @ "),
+            "expected ' @ ' separator in process name: {proc_name_env:?}"
         );
 
         // Log channel propagated
@@ -1290,7 +1289,7 @@ mod tests {
 
         // v0 bootstrap by default but it doesn't matter here.
         let bootstrap = Bootstrap::default();
-        let proc_id = ProcId(any_unix_addr(), "exit-7".into());
+        let proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "exit-7");
         let opts = LaunchOptions {
             command: with_sh("exit 7"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1298,12 +1297,12 @@ mod tests {
             want_stdio: false,
             tail_lines: 0,
             log_channel: None,
+            proc_bind: None,
         };
 
         let lr = launcher.launch(&proc_id, opts).await.expect("launch");
 
-        let exit = RealClock
-            .timeout(Duration::from_secs(5), lr.exit_rx)
+        let exit = tokio::time::timeout(Duration::from_secs(5), lr.exit_rx)
             .await
             .expect("timed out waiting for exit_rx")
             .expect("exit_rx dropped");
@@ -1332,7 +1331,7 @@ mod tests {
 
         // v0 bootstrap by default but it doesn't matter here.
         let bootstrap = Bootstrap::default();
-        let proc_id = ProcId(any_unix_addr(), "killed".into());
+        let proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "killed");
         let opts = LaunchOptions {
             command: with_sh("sleep 30"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1340,6 +1339,7 @@ mod tests {
             want_stdio: false,
             tail_lines: 0,
             log_channel: None,
+            proc_bind: None,
         };
 
         let lr = launcher.launch(&proc_id, opts).await.expect("launch");
@@ -1354,12 +1354,11 @@ mod tests {
         }
 
         // Give the process a moment to start
-        RealClock.sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         launcher.kill(&proc_id).await.expect("kill");
 
-        let exit = RealClock
-            .timeout(Duration::from_secs(5), lr.exit_rx)
+        let exit = tokio::time::timeout(Duration::from_secs(5), lr.exit_rx)
             .await
             .expect("timed out waiting for exit_rx")
             .expect("exit_rx dropped");
@@ -1394,7 +1393,7 @@ mod tests {
 
         // v0 bootstrap by default but it doesn't matter here.
         let bootstrap = Bootstrap::default();
-        let proc_id = ProcId(any_unix_addr(), "terminated".into());
+        let proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "terminated");
         let opts = LaunchOptions {
             command: with_sh("sleep 30"),
             bootstrap_payload: bootstrap.to_env_safe_string().unwrap(),
@@ -1402,20 +1401,20 @@ mod tests {
             want_stdio: false,
             tail_lines: 0,
             log_channel: None,
+            proc_bind: None,
         };
 
         let lr = launcher.launch(&proc_id, opts).await.expect("launch");
 
         // Give the process a moment to start
-        RealClock.sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         launcher
             .terminate(&proc_id, Duration::from_secs(5))
             .await
             .expect("terminate");
 
-        let exit = RealClock
-            .timeout(Duration::from_secs(5), lr.exit_rx)
+        let exit = tokio::time::timeout(Duration::from_secs(5), lr.exit_rx)
             .await
             .expect("timed out waiting for exit_rx")
             .expect("exit_rx dropped");
@@ -1438,7 +1437,7 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let unknown_proc_id = ProcId(any_unix_addr(), "unknown".into());
+        let unknown_proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "unknown");
 
         let result = launcher
             .terminate(&unknown_proc_id, Duration::from_secs(1))
@@ -1460,7 +1459,7 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let unknown_proc_id = ProcId(any_unix_addr(), "unknown".into());
+        let unknown_proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "unknown");
 
         let result = launcher.kill(&unknown_proc_id).await;
 
@@ -1539,8 +1538,7 @@ mod tests {
             "{}/monarch-drop-cleanup-{}-{}.marker",
             runtime_dir,
             std::process::id(),
-            RealClock
-                .system_time_now()
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
@@ -1564,7 +1562,7 @@ mod tests {
         );
 
         let bootstrap = Bootstrap::default();
-        let proc_id = ProcId(any_unix_addr(), "drop-cleanup-test".into());
+        let proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "drop-cleanup-test");
 
         let exit_rx;
 
@@ -1578,6 +1576,7 @@ mod tests {
                 want_stdio: false,
                 tail_lines: 0,
                 log_channel: None,
+                proc_bind: None,
             };
 
             let lr = launcher.launch(&proc_id, opts).await.expect("launch");
@@ -1606,7 +1605,7 @@ mod tests {
                     std::time::Instant::now() < deadline,
                     "Marker file never showed 'running' - child may have failed or died early"
                 );
-                RealClock.sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
             // Launcher drops here - Drop should stop the unit
@@ -1615,8 +1614,7 @@ mod tests {
         // After drop: process should exit within timeout. Use
         // generous timeout because Drop cleanup is multi-step: spawn
         // thread → build runtime → connect D-Bus → call StopUnit.
-        let exit = RealClock
-            .timeout(Duration::from_secs(30), exit_rx)
+        let exit = tokio::time::timeout(Duration::from_secs(30), exit_rx)
             .await
             .expect(
                 "timed out waiting for process to exit after Drop - cleanup may be slow or stuck",
@@ -1663,7 +1661,7 @@ mod tests {
 
         let launcher = SystemdProcLauncher::new();
 
-        let proc_id = ProcId(any_unix_addr(), "long-running".into());
+        let proc_id = hyperactor_reference::ProcId::with_name(any_unix_addr(), "long-running");
         let bootstrap = Bootstrap::default();
         let opts = LaunchOptions {
             command: with_sh("sleep 60"),
@@ -1672,6 +1670,7 @@ mod tests {
             want_stdio: false,
             tail_lines: 0,
             log_channel: None,
+            proc_bind: None,
         };
 
         // IMPORTANT: lr must be mutable because we take &mut
@@ -1679,13 +1678,11 @@ mod tests {
         let mut lr = launcher.launch(&proc_id, opts).await.expect("launch");
 
         // Wait 12 seconds — longer than the old buggy 10s timeout.
-        RealClock.sleep(Duration::from_secs(12)).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
 
         // Assert exit_rx has NOT resolved. We use a short timeout
         // that we EXPECT to time out.
-        let poll = RealClock
-            .timeout(Duration::from_millis(100), &mut lr.exit_rx)
-            .await;
+        let poll = tokio::time::timeout(Duration::from_millis(100), &mut lr.exit_rx).await;
 
         assert!(
             poll.is_err(),
@@ -1695,8 +1692,7 @@ mod tests {
         // Now kill the proc and verify exit_rx resolves.
         launcher.kill(&proc_id).await.expect("kill");
 
-        let exit = RealClock
-            .timeout(Duration::from_secs(5), lr.exit_rx)
+        let exit = tokio::time::timeout(Duration::from_secs(5), lr.exit_rx)
             .await
             .expect("timed out waiting for exit after kill")
             .expect("exit_rx dropped");

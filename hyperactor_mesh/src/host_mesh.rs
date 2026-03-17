@@ -10,8 +10,6 @@ use hyperactor::Actor;
 use hyperactor::Handler;
 use hyperactor::accum::StreamingReducerOpts;
 use hyperactor::channel::ChannelTransport;
-use hyperactor::clock::Clock;
-use hyperactor::clock::RealClock;
 use hyperactor::host::Host;
 use hyperactor::host::LocalProcManager;
 use hyperactor::host::SERVICE_PROC_NAME;
@@ -31,10 +29,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperactor::ActorRef;
-use hyperactor::ProcId;
 use hyperactor::channel::ChannelAddr;
 use hyperactor::context;
+use hyperactor::reference as hyperactor_reference;
 use ndslice::Extent;
 use ndslice::Region;
 use ndslice::ViewExt;
@@ -54,6 +51,7 @@ use crate::ValueMesh;
 use crate::alloc::Alloc;
 use crate::bootstrap::BootstrapCommand;
 use crate::bootstrap::BootstrapProcManager;
+use crate::bootstrap::ProcBind;
 pub use crate::host_mesh::host_agent::HostAgent;
 use crate::host_mesh::host_agent::HostAgentMode;
 use crate::host_mesh::host_agent::HostMeshAgentProcMeshTrampoline;
@@ -74,6 +72,12 @@ use crate::resource::ProcSpec;
 use crate::resource::RankedValues;
 use crate::resource::Status;
 use crate::transport::DEFAULT_TRANSPORT;
+
+/// Actor name for `HostMeshController` when spawned as a named child.
+pub const HOST_MESH_CONTROLLER_NAME: &str = "host_mesh_controller";
+
+/// Actor name for `ProcMeshController` when spawned as a named child.
+pub const PROC_MESH_CONTROLLER_NAME: &str = "proc_mesh_controller";
 
 declare_attrs! {
     /// The maximum idle time between updates while spawning proc
@@ -108,21 +112,21 @@ wirevalue::register_type!(HostRef);
 
 impl HostRef {
     /// The host mesh agent associated with this host.
-    fn mesh_agent(&self) -> ActorRef<HostAgent> {
-        ActorRef::attest(
+    fn mesh_agent(&self) -> hyperactor_reference::ActorRef<HostAgent> {
+        hyperactor_reference::ActorRef::attest(
             self.service_proc()
                 .actor_id(host_agent::HOST_MESH_AGENT_ACTOR_NAME, 0),
         )
     }
 
     /// The ProcId for the proc with name `name` on this host.
-    fn named_proc(&self, name: &Name) -> ProcId {
-        ProcId(self.0.clone(), name.to_string())
+    fn named_proc(&self, name: &Name) -> hyperactor_reference::ProcId {
+        hyperactor_reference::ProcId::with_name(self.0.clone(), name.to_string())
     }
 
     /// The service proc on this host.
-    fn service_proc(&self) -> ProcId {
-        ProcId(self.0.clone(), SERVICE_PROC_NAME.to_string())
+    fn service_proc(&self) -> hyperactor_reference::ProcId {
+        hyperactor_reference::ProcId::with_name(self.0.clone(), SERVICE_PROC_NAME)
     }
 
     /// Request an orderly teardown of this host and all procs it
@@ -159,10 +163,10 @@ impl HostRef {
     }
 }
 
-impl TryFrom<ActorRef<HostAgent>> for HostRef {
+impl TryFrom<hyperactor_reference::ActorRef<HostAgent>> for HostRef {
     type Error = crate::Error;
 
-    fn try_from(value: ActorRef<HostAgent>) -> Result<Self, crate::Error> {
+    fn try_from(value: hyperactor_reference::ActorRef<HostAgent>) -> Result<Self, crate::Error> {
         let proc_id = value.actor_id().proc_id();
         Ok(HostRef(proc_id.addr().clone()))
     }
@@ -250,7 +254,7 @@ impl HostMesh {
 
         hyperactor_telemetry::notify_mesh_created(hyperactor_telemetry::MeshEvent {
             id: mesh_id_hash,
-            timestamp: RealClock.system_time_now(),
+            timestamp: std::time::SystemTime::now(),
             class: "Host".to_string(),
             given_name: self.name.name().to_string(),
             full_name: name_str,
@@ -261,7 +265,7 @@ impl HostMesh {
 
         // Notify telemetry of each HostAgent actor in this mesh.
         // These are skipped in Proc::spawn_inner. mesh_id directly points to host mesh.
-        let now = RealClock.system_time_now();
+        let now = std::time::SystemTime::now();
         for (rank, host) in self.current_ref.hosts().iter().enumerate() {
             let actor = host.mesh_agent();
             hyperactor_telemetry::notify_actor_created(hyperactor_telemetry::ActorEvent {
@@ -310,8 +314,10 @@ impl HostMesh {
     /// `boot.bootstrap().await` in those children.
     pub async fn local_with_bootstrap(bootstrap_cmd: BootstrapCommand) -> crate::Result<HostMesh> {
         if let Ok(Some(boot)) = Bootstrap::get_from_env() {
-            let err = boot.bootstrap().await;
-            tracing::error!("failed to bootstrap local host mesh process: {}", err);
+            let result = boot.bootstrap().await;
+            if let Err(err) = result {
+                tracing::error!("failed to bootstrap local host mesh process: {}", err);
+            }
             std::process::exit(1);
         }
 
@@ -326,7 +332,7 @@ impl HostMesh {
                 "host_agent",
                 HostAgent::new(HostAgentMode::Process {
                     host,
-                    exit_on_shutdown: false,
+                    shutdown_tx: None,
                 }),
             )
             .map_err(crate::Error::SingletonActorSpawnError)?;
@@ -407,8 +413,10 @@ impl HostMesh {
     /// TODO: thread through ownership
     pub async fn process(extent: Extent, command: BootstrapCommand) -> crate::Result<HostMesh> {
         if let Ok(Some(boot)) = Bootstrap::get_from_env() {
-            let err = boot.bootstrap().await;
-            tracing::error!("failed to bootstrap process host mesh process: {}", err);
+            let result = boot.bootstrap().await;
+            if let Err(err) = result {
+                tracing::error!("failed to bootstrap process host mesh process: {}", err);
+            }
             std::process::exit(1);
         }
 
@@ -558,14 +566,17 @@ impl HostMesh {
         // Spawn a unique mesh controller for each proc mesh, so the type of the
         // mesh can be preserved.
         let controller = HostMeshController::new(mesh.deref().clone());
+        // AI-3: controller name must include mesh identity for
+        // proc-wide ActorId uniqueness.
+        let controller_name = format!("{}_{}", HOST_MESH_CONTROLLER_NAME, mesh.name());
         let controller_handle = controller
-            .spawn(cx)
+            .spawn_with_name(cx, &controller_name)
             .map_err(|e| crate::Error::ControllerActorSpawnError(mesh.name().clone(), e))?;
         // Bind the actor's well-known ports (Signal, IntrospectMessage,
         // Undeliverable). Without this, the controller's mailbox has no
         // port entries and messages (including introspection queries)
         // are returned as undeliverable.
-        let _: hyperactor::ActorRef<HostMeshController> = controller_handle.bind();
+        let _: hyperactor::reference::ActorRef<HostMeshController> = controller_handle.bind();
 
         tracing::info!(name = "HostMeshStatus", status = "Allocate::Created");
 
@@ -881,7 +892,10 @@ impl HostMeshRef {
     }
 
     /// Create a new HostMeshRef from an arbitrary set of host mesh agents.
-    pub fn from_host_agents(name: Name, agents: Vec<ActorRef<HostAgent>>) -> crate::Result<Self> {
+    pub fn from_host_agents(
+        name: Name,
+        agents: Vec<hyperactor_reference::ActorRef<HostAgent>>,
+    ) -> crate::Result<Self> {
         Ok(Self {
             name,
             region: extent!(hosts = agents.len()).into(),
@@ -895,12 +909,25 @@ impl HostMeshRef {
     }
 
     /// Create a unit HostMeshRef from a host mesh agent.
-    pub fn from_host_agent(name: Name, agent: ActorRef<HostAgent>) -> crate::Result<Self> {
+    pub fn from_host_agent(
+        name: Name,
+        agent: hyperactor_reference::ActorRef<HostAgent>,
+    ) -> crate::Result<Self> {
         Ok(Self {
             name,
             region: Extent::unity().into(),
             ranks: Arc::new(vec![HostRef::try_from(agent)?]),
         })
+    }
+
+    /// Returns the host entries as `(addr_string, ActorRef<HostAgent>)` pairs.
+    /// Used by `MeshAdminAgent::effective_hosts()` to merge C into the
+    /// admin's host list (see CH-1 in mesh_admin module doc).
+    pub(crate) fn host_entries(&self) -> Vec<(String, hyperactor_reference::ActorRef<HostAgent>)> {
+        self.ranks
+            .iter()
+            .map(|h| (h.0.to_string(), h.mesh_agent()))
+            .collect()
     }
 
     /// Push client config to all host agents in this mesh, in parallel.
@@ -942,7 +969,7 @@ impl HostMeshRef {
             }
         }));
 
-        match RealClock.timeout(timeout, barrier).await {
+        match tokio::time::timeout(timeout, barrier).await {
             Ok(results) => {
                 let success = results.iter().filter(|&&r| r).count();
                 let failed = num_hosts - success;
@@ -966,6 +993,12 @@ impl HostMeshRef {
     /// Spawn a ProcMesh onto this host mesh. The per_host extent specifies the shape
     /// of the procs to spawn on each host.
     ///
+    /// `proc_bind`, when provided, is a per-process CPU/NUMA binding
+    /// configuration. Its length must equal the number of ranks in
+    /// `per_host`. Each entry maps binding keys (`cpunodebind`,
+    /// `membind`, `physcpubind`, `cpus`) to their values.
+    /// Only takes effect when running on Linux.
+    ///
     /// Currently, spawn issues direct calls to each host agent. This will be fixed by
     /// maintaining a comm actor on the host service procs themselves.
     #[allow(clippy::result_large_err)]
@@ -974,11 +1007,13 @@ impl HostMeshRef {
         cx: &C,
         name: &str,
         per_host: Extent,
+        proc_bind: Option<Vec<ProcBind>>,
     ) -> crate::Result<ProcMesh>
     where
         C::A: Handler<MeshFailure>,
     {
-        self.spawn_inner(cx, Name::new(name)?, per_host).await
+        self.spawn_inner(cx, Name::new(name)?, per_host, proc_bind)
+            .await
     }
 
     #[hyperactor::instrument(fields(host_mesh=self.name.to_string(), proc_mesh=proc_mesh_name.to_string()))]
@@ -987,13 +1022,16 @@ impl HostMeshRef {
         cx: &C,
         proc_mesh_name: Name,
         per_host: Extent,
+        proc_bind: Option<Vec<ProcBind>>,
     ) -> crate::Result<ProcMesh>
     where
         C::A: Handler<MeshFailure>,
     {
         tracing::info!(name = "HostMeshStatus", status = "ProcMesh::Spawn::Attempt");
         tracing::info!(name = "ProcMeshStatus", status = "Spawn::Attempt",);
-        let result = self.spawn_inner_inner(cx, proc_mesh_name, per_host).await;
+        let result = self
+            .spawn_inner_inner(cx, proc_mesh_name, per_host, proc_bind)
+            .await;
         match &result {
             Ok(_) => {
                 tracing::info!(name = "HostMeshStatus", status = "ProcMesh::Spawn::Success");
@@ -1012,6 +1050,7 @@ impl HostMeshRef {
         cx: &C,
         proc_mesh_name: Name,
         per_host: Extent,
+        proc_bind: Option<Vec<ProcBind>>,
     ) -> crate::Result<ProcMesh>
     where
         C::A: Handler<MeshFailure>,
@@ -1026,6 +1065,13 @@ impl HostMeshRef {
             return Err(crate::Error::ConfigurationError(anyhow::anyhow!(
                 "per_host dims overlap with existing dims when spawning proc mesh"
             )));
+        }
+        if let Some(proc_bind) = proc_bind.as_ref() {
+            if proc_bind.len() != per_host.num_ranks() {
+                return Err(crate::Error::ConfigurationError(anyhow::anyhow!(
+                    "proc_bind length does not match per_host extent"
+                )));
+            }
         }
 
         let extent = self
@@ -1068,12 +1114,13 @@ impl HostMeshRef {
                 let create_rank = per_host.num_ranks() * host_rank + per_host_rank;
                 let proc_name = Name::new(format!("{}_{}", proc_mesh_name.name(), per_host_rank))?;
                 proc_names.push(proc_name.clone());
+                let bind = proc_bind.as_ref().map(|v| v[per_host_rank].clone());
                 host.mesh_agent()
                     .create_or_update(
                         cx,
                         proc_name.clone(),
                         resource::Rank::new(create_rank),
-                        ProcSpec::new(client_config_override.clone()),
+                        ProcSpec::new(client_config_override.clone(), bind),
                     )
                     .await
                     .map_err(|e| {
@@ -1106,7 +1153,7 @@ impl HostMeshRef {
                     proc_id,
                     create_rank,
                     // TODO: specify or retrieve from state instead, to avoid attestation.
-                    ActorRef::attest(
+                    hyperactor_reference::ActorRef::attest(
                         host.named_proc(&proc_name)
                             .actor_id(crate::proc_agent::PROC_AGENT_ACTOR_NAME, 0),
                     ),
@@ -1114,7 +1161,7 @@ impl HostMeshRef {
             }
         }
 
-        let start_time = RealClock.now();
+        let start_time = tokio::time::Instant::now();
 
         // Wait on accumulated StatusMesh snapshots until complete or
         // timeout.
@@ -1153,12 +1200,11 @@ impl HostMeshRef {
                         .map_err(|e| {
                             crate::Error::SendingError(mesh_agent.actor_id().clone(), e.into())
                         })?;
-                    let state = match RealClock
-                        .timeout(
-                            hyperactor_config::global::get(PROC_SPAWN_MAX_IDLE),
-                            reply_rx.recv(),
-                        )
-                        .await
+                    let state = match tokio::time::timeout(
+                        hyperactor_config::global::get(PROC_SPAWN_MAX_IDLE),
+                        reply_rx.recv(),
+                    )
+                    .await
                     {
                         Ok(Ok(state)) => state,
                         _ => resource::State {
@@ -1209,14 +1255,17 @@ impl HostMeshRef {
             // Spawn a unique mesh controller for each proc mesh, so the type of the
             // mesh can be preserved.
             let controller = ProcMeshController::new(mesh.deref().clone());
+            // AI-3: controller name must include mesh identity for
+            // proc-wide ActorId uniqueness.
+            let controller_name = format!("{}_{}", PROC_MESH_CONTROLLER_NAME, mesh.name());
             let controller_handle = controller
-                .spawn(cx)
+                .spawn_with_name(cx, &controller_name)
                 .map_err(|e| crate::Error::ControllerActorSpawnError(mesh.name().clone(), e))?;
             // Bind the actor's well-known ports (Signal, IntrospectMessage,
             // Undeliverable). Without this, the controller's mailbox has no
             // port entries and messages (including introspection queries)
             // are returned as undeliverable.
-            let _: hyperactor::ActorRef<ProcMeshController> = controller_handle.bind();
+            let _: hyperactor::reference::ActorRef<ProcMeshController> = controller_handle.bind();
         }
         mesh
     }
@@ -1244,11 +1293,26 @@ impl HostMeshRef {
         cx: &impl hyperactor::context::Actor,
         admin_addr: Option<std::net::SocketAddr>,
     ) -> anyhow::Result<String> {
-        let hosts: Vec<(String, ActorRef<HostAgent>)> = self
+        let mut hosts: Vec<(String, hyperactor_reference::ActorRef<HostAgent>)> = self
             .ranks
             .iter()
             .map(|h| (h.0.to_string(), h.mesh_agent()))
             .collect();
+
+        // CH-1: see mesh_admin module doc. Include C (the client
+        // host) so the admin can introspect it. Dedup for C in A.
+        if let Some(client_host) = crate::global_context::try_this_host() {
+            for (addr, agent_ref) in client_host.host_entries() {
+                let agent_id = agent_ref.actor_id();
+                if !hosts
+                    .iter()
+                    .any(|(_, existing)| existing.actor_id() == agent_id)
+                {
+                    hosts.push((addr, agent_ref));
+                }
+            }
+        }
+
         let root_client_id = cx.mailbox().actor_id().clone();
 
         let head_agent = self.ranks[0].mesh_agent();
@@ -1264,7 +1328,7 @@ impl HostMeshRef {
         &self,
         cx: &impl hyperactor::context::Actor,
         proc_mesh_name: &Name,
-        procs: impl IntoIterator<Item = ProcId>,
+        procs: impl IntoIterator<Item = hyperactor_reference::ProcId>,
         region: Region,
         reason: String,
     ) -> anyhow::Result<()> {
@@ -1321,7 +1385,7 @@ impl HostMeshRef {
                 .join(", ")
         );
 
-        let start_time = RealClock.now();
+        let start_time = tokio::time::Instant::now();
 
         match GetRankStatus::wait(
             rx,
@@ -1380,13 +1444,13 @@ impl HostMeshRef {
     pub(crate) async fn proc_states(
         &self,
         cx: &impl context::Actor,
-        procs: impl IntoIterator<Item = ProcId>,
+        procs: impl IntoIterator<Item = hyperactor_reference::ProcId>,
         region: Region,
     ) -> crate::Result<ValueMesh<resource::State<ProcState>>> {
         let (tx, mut rx) = cx.mailbox().open_port();
 
         let mut num_ranks = 0;
-        let procs: Vec<ProcId> = procs.into_iter().collect();
+        let procs: Vec<hyperactor_reference::ProcId> = procs.into_iter().collect();
         let mut proc_names = Vec::new();
         for proc_id in procs.iter() {
             num_ranks += 1;
@@ -1422,7 +1486,7 @@ impl HostMeshRef {
             // the agent will be unresponsive.
             // We handle this by setting a timeout on the recv, and if we don't get a
             // message we assume the agent is dead and return a failed state.
-            let state = RealClock.timeout(timeout, rx.recv()).await;
+            let state = tokio::time::timeout(timeout, rx.recv()).await;
             if let Ok(state) = state {
                 // Handle non-timeout receiver error.
                 let state = state?;
@@ -1646,7 +1710,7 @@ mod tests {
                 .unwrap();
 
             let proc_mesh1 = host_mesh
-                .spawn(instance, "test_1", Extent::unity())
+                .spawn(instance, "test_1", Extent::unity(), None)
                 .await
                 .unwrap();
 
@@ -1654,7 +1718,7 @@ mod tests {
                 proc_mesh1.spawn(instance, "test", &()).await.unwrap();
 
             let proc_mesh2 = host_mesh
-                .spawn(instance, "test_2", extent!(gpus = 3, extra = 2))
+                .spawn(instance, "test_2", extent!(gpus = 3, extra = 2), None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1786,7 +1850,7 @@ mod tests {
         let host_mesh = HostMeshRef::from_hosts(Name::new("test").unwrap(), hosts);
 
         let proc_mesh = host_mesh
-            .spawn(&testing::instance(), "test", Extent::unity())
+            .spawn(&testing::instance(), "test", Extent::unity(), None)
             .await
             .unwrap();
 
@@ -1849,7 +1913,7 @@ mod tests {
         let instance = testing::instance();
 
         let err = host_mesh
-            .spawn(&instance, "test", Extent::unity())
+            .spawn(&instance, "test", Extent::unity(), None)
             .await
             .unwrap_err();
         assert_matches!(
@@ -1895,7 +1959,7 @@ mod tests {
         let instance = testing::instance();
 
         let err = host_mesh
-            .spawn(&instance, "test", Extent::unity())
+            .spawn(&instance, "test", Extent::unity(), None)
             .await
             .unwrap_err();
         let statuses = err.into_proc_spawn_error().unwrap();
@@ -1931,7 +1995,10 @@ mod tests {
         let instance = testing::instance();
 
         let mut hm = testing::host_mesh(2).await;
-        let proc_mesh = hm.spawn(instance, "test", Extent::unity()).await.unwrap();
+        let proc_mesh = hm
+            .spawn(instance, "test", Extent::unity(), None)
+            .await
+            .unwrap();
 
         let actor_mesh: ActorMesh<testactor::TestActor> =
             proc_mesh.spawn(instance, "test", &()).await.unwrap();

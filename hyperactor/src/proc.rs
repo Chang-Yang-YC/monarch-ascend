@@ -6,10 +6,34 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! This module provides [`Proc`], which is the runtime used within a single
-//! proc.
-
-// TODO: define a set of proc errors and plumb these throughout
+//! [`Proc`] is an addressable actor-runtime boundary.
+//!
+//! It owns actor lifecycle (spawn, run, terminate), routes messages
+//! to local actors, forwards messages for remote destinations, and
+//! hosts supervision state.
+//!
+//! It also stores bounded snapshots of terminated actors for
+//! post-mortem introspection.
+//!
+//! ## Client instance invariants (CI-*)
+//!
+//! - **CI-1 (client status):** `IntrospectMessage::Query` on an
+//!   introspectable instance returns `status: "client"` and
+//!   `actor_type: "()"` in attrs.
+//! - **CI-2 (snapshot on drop):** Dropping the returned `Instance<()>`
+//!   transitions its status to terminal, causing the introspect task
+//!   to store a terminated snapshot.
+//!
+//! ## Actor identity invariants (AI-*)
+//!
+//! - **AI-1 (named-child pid):** The pid of a named child must
+//!   remain in the parent's sibling pid domain. The name is
+//!   presentation only; the numeric pid is allocated from the
+//!   parent's counter, preserving supervision linkage.
+//! - **AI-3 (controller ActorId uniqueness):** Callers must ensure
+//!   the name is unique proc-wide. Two children with the same name
+//!   under different parents get distinct pids but the same name
+//!   prefix.
 
 use std::any::Any;
 use std::any::TypeId;
@@ -40,7 +64,11 @@ use dashmap::mapref::multiple::RefMulti;
 use futures::FutureExt;
 use hyperactor_config::Flattrs;
 use hyperactor_telemetry::ActorStatusEvent;
+use hyperactor_telemetry::generate_actor_status_event_id;
+use hyperactor_telemetry::hash_to_u64;
 use hyperactor_telemetry::notify_actor_status_changed;
+use hyperactor_telemetry::notify_message;
+use hyperactor_telemetry::notify_message_status;
 use hyperactor_telemetry::recorder::Recording;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -53,7 +81,6 @@ use wirevalue::TypeInfo;
 
 use crate as hyperactor;
 use crate::Actor;
-use crate::ActorRef;
 use crate::Handler;
 use crate::Message;
 use crate::RemoteMessage;
@@ -71,16 +98,11 @@ use crate::channel;
 use crate::channel::ChannelAddr;
 use crate::channel::ChannelError;
 use crate::channel::ChannelTransport;
-use crate::clock::Clock;
-use crate::clock::ClockKind;
-use crate::clock::RealClock;
 use crate::config;
 use crate::context;
 use crate::context::Mailbox as _;
 use crate::introspect::IntrospectMessage;
-use crate::introspect::NodePayload;
-use crate::introspect::PublishedProperties;
-use crate::introspect::PublishedPropertiesKind;
+use crate::introspect::IntrospectResult;
 use crate::mailbox::BoxedMailboxSender;
 use crate::mailbox::DeliveryError;
 use crate::mailbox::DialMailboxRouter;
@@ -106,10 +128,7 @@ use crate::ordering::SeqInfo;
 use crate::ordering::Sequencer;
 use crate::ordering::ordered_channel;
 use crate::panic_handler;
-use crate::reference::ActorId;
-use crate::reference::Index;
-use crate::reference::PortId;
-use crate::reference::ProcId;
+use crate::reference;
 use crate::supervision::ActorSupervisionEvent;
 
 /// This is used to mint new local ranks for [`Proc::local`].
@@ -137,7 +156,7 @@ impl fmt::Debug for Proc {
 struct ProcState {
     /// The proc's id. This should be globally unique, but is not (yet)
     /// for local-only procs.
-    proc_id: ProcId,
+    proc_id: reference::ProcId,
 
     /// A muxer instance that has entries for every actor managed by
     /// the proc.
@@ -146,25 +165,24 @@ struct ProcState {
     /// Sender used to forward messages outside of the proc.
     forwarder: BoxedMailboxSender,
 
-    /// All of the roots (i.e., named actors with pid=0) in the proc.
-    /// These are also known as "global actors", since they may be
-    /// spawned remotely.
+    /// Per-name atomic index allocator. Used by `allocate_root_id`
+    /// (index 0, counter starts at 1) and `allocate_child_id`
+    /// (increments the parent's counter). Each root name gets its
+    /// own independent counter.
     roots: DashMap<String, AtomicUsize>,
 
     /// All actor instances in this proc.
-    instances: DashMap<ActorId, WeakInstanceCell>,
+    instances: DashMap<reference::ActorId, WeakInstanceCell>,
 
     /// Snapshots of terminated actors for post-mortem introspection.
     /// Populated by the introspect task just before it exits on
     /// terminal status. Bounded by
     /// [`config::TERMINATED_SNAPSHOT_RETENTION`].
-    terminated_snapshots: DashMap<ActorId, crate::introspect::NodePayload>,
+    terminated_snapshots: DashMap<reference::ActorId, crate::introspect::IntrospectResult>,
 
     /// Used by root actors to send events to the actor coordinating
     /// supervision of root actors in this proc.
     supervision_coordinator_port: OnceLock<PortHandle<ActorSupervisionEvent>>,
-
-    clock: ClockKind,
 }
 
 impl Drop for ProcState {
@@ -198,42 +216,8 @@ pub struct ActorInstance<A: Actor> {
 }
 
 impl Proc {
-    /// Create a new proc with the given proc id and forwarder.
-    pub fn new(proc_id: ProcId, forwarder: BoxedMailboxSender) -> Self {
-        Self::new_with_clock(proc_id, forwarder, ClockKind::default())
-    }
-
-    /// Create a new direct-addressed proc.
-    pub fn direct(addr: ChannelAddr, name: String) -> Result<Self, ChannelError> {
-        let (addr, rx) = channel::serve(addr)?;
-        let proc_id = ProcId(addr, name);
-        let proc = Self::new(proc_id, DialMailboxRouter::new().into_boxed());
-        proc.clone().serve(rx);
-        Ok(proc)
-    }
-
-    /// Create a new direct-addressed proc with a default sender for the forwarder.
-    pub fn direct_with_default(
-        addr: ChannelAddr,
-        name: String,
-        default: BoxedMailboxSender,
-    ) -> Result<Self, ChannelError> {
-        let (addr, rx) = channel::serve(addr)?;
-        let proc_id = ProcId(addr, name);
-        let proc = Self::new(
-            proc_id,
-            DialMailboxRouter::new_with_default(default).into_boxed(),
-        );
-        proc.clone().serve(rx);
-        Ok(proc)
-    }
-
-    /// Create a new proc with the given proc id, forwarder and clock kind.
-    pub fn new_with_clock(
-        proc_id: ProcId,
-        forwarder: BoxedMailboxSender,
-        clock: ClockKind,
-    ) -> Self {
+    /// Create a pre-configured proc with the given proc id and forwarder.
+    pub fn configured(proc_id: reference::ProcId, forwarder: BoxedMailboxSender) -> Self {
         tracing::info!(
             proc_id = %proc_id,
             name = "ProcStatus",
@@ -249,9 +233,17 @@ impl Proc {
                 instances: DashMap::new(),
                 terminated_snapshots: DashMap::new(),
                 supervision_coordinator_port: OnceLock::new(),
-                clock,
             }),
         }
+    }
+
+    /// Create a new direct-addressed proc.
+    pub fn direct(addr: ChannelAddr, name: String) -> Result<Self, ChannelError> {
+        let (addr, rx) = channel::serve(addr)?;
+        let proc_id = reference::ProcId::with_name(addr, name);
+        let proc = Self::configured(proc_id, DialMailboxRouter::new().into_boxed());
+        proc.clone().serve(rx);
+        Ok(proc)
     }
 
     /// Set the supervision coordinator's port for this proc. Return Err if it is
@@ -297,12 +289,12 @@ impl Proc {
     pub fn local() -> Self {
         let rank = NEXT_LOCAL_RANK.fetch_add(1, Ordering::Relaxed);
         let addr = ChannelAddr::any(ChannelTransport::Local);
-        let proc_id = ProcId(addr, format!("local_{}", rank));
-        Proc::new(proc_id, BoxedMailboxSender::new(PanickingMailboxSender))
+        let proc_id = reference::ProcId::unique(addr, format!("local_{}", rank));
+        Proc::configured(proc_id, BoxedMailboxSender::new(PanickingMailboxSender))
     }
 
     /// The proc's ID.
-    pub fn proc_id(&self) -> &ProcId {
+    pub fn proc_id(&self) -> &reference::ProcId {
         &self.state().proc_id
     }
 
@@ -317,35 +309,30 @@ impl Proc {
         self.inner.as_ref()
     }
 
-    /// The proc's clock.
-    pub fn clock(&self) -> &ClockKind {
-        &self.state().clock
-    }
-
     /// A global runtime proc used by this crate.
     pub(crate) fn runtime() -> &'static Proc {
         static RUNTIME_PROC: OnceLock<Proc> = OnceLock::new();
         RUNTIME_PROC.get_or_init(|| {
             let addr = ChannelAddr::any(ChannelTransport::Local);
-            let proc_id = ProcId(addr, "hyperactor_runtime".to_string());
-            Proc::new(proc_id, BoxedMailboxSender::new(PanickingMailboxSender))
+            let proc_id = reference::ProcId::unique(addr, "hyperactor_runtime");
+            Proc::configured(proc_id, BoxedMailboxSender::new(PanickingMailboxSender))
         })
     }
 
     /// Attach a mailbox to the proc with the provided root name.
     pub fn attach(&self, name: &str) -> Result<Mailbox, anyhow::Error> {
-        let actor_id: ActorId = self.allocate_root_id(name)?;
+        let actor_id: reference::ActorId = self.allocate_root_id(name)?;
         Ok(self.bind_mailbox(actor_id))
     }
 
     /// Attach a mailbox to the proc as a child actor.
-    pub fn attach_child(&self, parent_id: &ActorId) -> Result<Mailbox, anyhow::Error> {
-        let actor_id: ActorId = self.allocate_child_id(parent_id)?;
+    pub fn attach_child(&self, parent_id: &reference::ActorId) -> Result<Mailbox, anyhow::Error> {
+        let actor_id: reference::ActorId = self.allocate_child_id(parent_id)?;
         Ok(self.bind_mailbox(actor_id))
     }
 
     /// Bind a mailbox to the proc.
-    fn bind_mailbox(&self, actor_id: ActorId) -> Mailbox {
+    fn bind_mailbox(&self, actor_id: reference::ActorId) -> Mailbox {
         let mbox = Mailbox::new(actor_id, BoxedMailboxSender::new(self.downgrade()));
 
         // TODO: T210748165 tie the muxer entry to the lifecycle of the mailbox held
@@ -359,14 +346,14 @@ impl Proc {
     pub fn attach_actor<R, M>(
         &self,
         name: &str,
-    ) -> Result<(Instance<()>, ActorRef<R>, PortReceiver<M>), anyhow::Error>
+    ) -> Result<(Instance<()>, reference::ActorRef<R>, PortReceiver<M>), anyhow::Error>
     where
         M: RemoteMessage,
         R: Referable + RemoteHandles<M>,
     {
         let (instance, _handle) = self.instance(name)?;
         let (_handle, rx) = instance.bind_actor_port::<M>();
-        let actor_ref = ActorRef::attest(instance.self_id().clone());
+        let actor_ref = reference::ActorRef::attest(instance.self_id().clone());
         Ok((instance, actor_ref, rx))
     }
 
@@ -382,7 +369,7 @@ impl Proc {
     #[hyperactor::instrument(fields(actor_id = actor_id.to_string(), actor_name = actor_id.name(), actor_type = std::any::type_name::<A>()))]
     fn spawn_inner<A: Actor>(
         &self,
-        actor_id: ActorId,
+        actor_id: reference::ActorId,
         actor: A,
         parent: Option<InstanceCell>,
     ) -> Result<ActorHandle<A>, anyhow::Error> {
@@ -411,15 +398,7 @@ impl Proc {
     /// to `IntrospectMessage::Query` and is visible and navigable in
     /// admin tooling such as the mesh TUI.
     ///
-    /// # Invariants
-    ///
-    /// - **CI-1 (client status):** `IntrospectMessage::Query` returns
-    ///   `NodeProperties::Actor { actor_status: "client",
-    ///   actor_type: "()", .. }`.
-    /// - **CI-2 (snapshot on drop):** Dropping the returned
-    ///   `Instance<()>` transitions its status to terminal, which
-    ///   causes the introspect task to store a terminated snapshot
-    ///   (same post-mortem semantics as regular actors).
+    /// See CI-1, CI-2 in module doc.
     ///
     /// Requires an active Tokio runtime (calls `tokio::spawn`).
     pub fn introspectable_instance(
@@ -475,6 +454,13 @@ impl Proc {
     }
 
     /// Traverse all actor trees in this proc, starting from root actors (pid=0).
+    ///
+    /// **Caution:** This holds DashMap shard read locks while doing
+    /// `Weak::upgrade()` and recursively walking the actor tree per
+    /// entry. Under rapid actor churn, this causes convoy starvation
+    /// with concurrent `insert`/`remove` operations. Prefer
+    /// `all_instance_keys()` with point lookups if you only need
+    /// actor IDs. Currently unused in production code.
     pub fn traverse<F>(&self, f: &mut F)
     where
         F: FnMut(&InstanceCell, usize),
@@ -489,7 +475,7 @@ impl Proc {
     }
 
     /// Look up an instance by ActorId.
-    pub fn get_instance(&self, actor_id: &ActorId) -> Option<InstanceCell> {
+    pub fn get_instance(&self, actor_id: &reference::ActorId) -> Option<InstanceCell> {
         self.state()
             .instances
             .get(actor_id)
@@ -497,7 +483,14 @@ impl Proc {
     }
 
     /// Returns the ActorIds of all root actors (pid=0) in this proc.
-    pub fn root_actor_ids(&self) -> Vec<ActorId> {
+    ///
+    /// **Caution:** This iterates the full DashMap under shard read
+    /// locks. The per-entry work is lightweight (key filter + clone),
+    /// but under very rapid churn the iteration can still contend
+    /// with concurrent writes. Prefer `all_instance_keys()` with a
+    /// post-filter if this becomes a hot path. Currently unused in
+    /// production code.
+    pub fn root_actor_ids(&self) -> Vec<reference::ActorId> {
         self.state()
             .instances
             .iter()
@@ -514,7 +507,7 @@ impl Proc {
     /// actors whose `InstanceCell` has been dropped and actors that
     /// have stopped or failed but whose Arc is still held (e.g. by
     /// the introspect task during teardown).
-    pub fn all_actor_ids(&self) -> Vec<ActorId> {
+    pub fn all_actor_ids(&self) -> Vec<reference::ActorId> {
         self.state()
             .instances
             .iter()
@@ -528,11 +521,30 @@ impl Proc {
             .collect()
     }
 
+    /// Snapshot all instance keys from the DashMap without inspecting
+    /// values. Each shard read lock is held only long enough to clone
+    /// the key — no `Weak::upgrade()`, no `watch::borrow()`, no
+    /// `is_terminal()` check. This minimises shard lock hold time to
+    /// avoid convoy starvation with concurrent `insert`/`remove`
+    /// operations during rapid actor churn.
+    ///
+    /// The returned list may include actors that are terminal or
+    /// whose `WeakInstanceCell` no longer upgrades. Callers should
+    /// tolerate stale entries (e.g. by handling "not found" on
+    /// subsequent per-actor lookups).
+    pub fn all_instance_keys(&self) -> Vec<reference::ActorId> {
+        self.state()
+            .instances
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Look up a terminated actor's snapshot by ID.
     pub fn terminated_snapshot(
         &self,
-        actor_id: &ActorId,
-    ) -> Option<crate::introspect::NodePayload> {
+        actor_id: &reference::ActorId,
+    ) -> Option<crate::introspect::IntrospectResult> {
         self.state()
             .terminated_snapshots
             .get(actor_id)
@@ -540,7 +552,7 @@ impl Proc {
     }
 
     /// Return all terminated actor IDs currently retained.
-    pub fn all_terminated_actor_ids(&self) -> Vec<ActorId> {
+    pub fn all_terminated_actor_ids(&self) -> Vec<reference::ActorId> {
         self.state()
             .terminated_snapshots
             .iter()
@@ -583,14 +595,27 @@ impl Proc {
         self.spawn_inner(actor_id, actor, Some(parent))
     }
 
+    /// Spawn a named child actor. Same as `spawn_child` but the child
+    /// gets a descriptive name instead of inheriting the parent's.
+    /// Supervision linkage to parent is preserved.
+    pub(crate) fn spawn_named_child<A: Actor>(
+        &self,
+        parent: InstanceCell,
+        name: &str,
+        actor: A,
+    ) -> Result<ActorHandle<A>, anyhow::Error> {
+        let actor_id = self.allocate_named_child_id(parent.actor_id(), name)?;
+        self.spawn_inner(actor_id, actor, Some(parent))
+    }
+
     /// Call `abort` on the `JoinHandle` associated with the given
     /// root actor. If successful return `Some(root.clone())` else
     /// `None`.
     pub fn abort_root_actor(
         &self,
-        root: &ActorId,
+        root: &reference::ActorId,
         this_handle: Option<&JoinHandle<()>>,
-    ) -> Option<impl Future<Output = ActorId>> {
+    ) -> Option<impl Future<Output = reference::ActorId>> {
         self.state()
             .instances
             .get(root)
@@ -629,7 +654,7 @@ impl Proc {
     /// returning a status observer if successful.
     pub fn stop_actor(
         &self,
-        actor_id: &ActorId,
+        actor_id: &reference::ActorId,
         reason: String,
     ) -> Option<watch::Receiver<ActorStatus>> {
         if let Some(entry) = self.state().instances.get(actor_id) {
@@ -668,7 +693,7 @@ impl Proc {
         timeout: Duration,
         cx: Option<&Context<'_, A>>,
         reason: &str,
-    ) -> Result<(Vec<ActorId>, Vec<ActorId>), anyhow::Error> {
+    ) -> Result<(Vec<reference::ActorId>, Vec<reference::ActorId>), anyhow::Error> {
         self.destroy_and_wait_except_current::<A>(timeout, cx, false, reason)
             .await
     }
@@ -689,7 +714,7 @@ impl Proc {
         cx: Option<&Context<'_, A>>,
         except_current: bool,
         reason: &str,
-    ) -> Result<(Vec<ActorId>, Vec<ActorId>), anyhow::Error> {
+    ) -> Result<(Vec<reference::ActorId>, Vec<reference::ActorId>), anyhow::Error> {
         tracing::debug!("{}: proc stopping", self.proc_id());
 
         let (this_handle, this_actor_id) = cx.map_or((None, None), |cx| {
@@ -720,14 +745,13 @@ impl Proc {
             .map(|(actor_id, root)| {
                 let actor_id = actor_id.clone();
                 async move {
-                    RealClock
-                        .timeout(
-                            timeout,
-                            root.wait_for(|state: &ActorStatus| state.is_terminal()),
-                        )
-                        .await
-                        .ok()
-                        .map(|_| actor_id)
+                    tokio::time::timeout(
+                        timeout,
+                        root.wait_for(|state: &ActorStatus| state.is_terminal()),
+                    )
+                    .await
+                    .ok()
+                    .map(|_| actor_id)
                 }
             })
             .collect();
@@ -794,7 +818,7 @@ impl Proc {
     ///   `ActorRef<R>`.
     pub fn resolve_actor_ref<R: Actor + Referable>(
         &self,
-        actor_ref: &ActorRef<R>,
+        actor_ref: &reference::ActorRef<R>,
     ) -> Option<ActorHandle<R>> {
         let cell = self.inner.instances.get(actor_ref.actor_id())?.upgrade()?;
         // An actor whose status is terminal has stopped processing
@@ -807,7 +831,7 @@ impl Proc {
     }
 
     /// Create a root allocation in the proc.
-    fn allocate_root_id(&self, name: &str) -> Result<ActorId, anyhow::Error> {
+    fn allocate_root_id(&self, name: &str) -> Result<reference::ActorId, anyhow::Error> {
         let name = name.to_string();
         match self.state().roots.entry(name.to_string()) {
             Entry::Vacant(entry) => {
@@ -817,12 +841,19 @@ impl Proc {
                 anyhow::bail!("an actor with name '{}' has already been spawned", name)
             }
         }
-        Ok(ActorId(self.state().proc_id.clone(), name.to_string(), 0))
+        Ok(reference::ActorId::new(
+            self.state().proc_id.clone(),
+            name.to_string(),
+            0,
+        ))
     }
 
     /// Create a child allocation in the proc.
     #[hyperactor::instrument(fields(actor_name=parent_id.name()))]
-    pub(crate) fn allocate_child_id(&self, parent_id: &ActorId) -> Result<ActorId, anyhow::Error> {
+    pub(crate) fn allocate_child_id(
+        &self,
+        parent_id: &reference::ActorId,
+    ) -> Result<reference::ActorId, anyhow::Error> {
         assert_eq!(*parent_id.proc_id(), self.state().proc_id);
         let pid = match self.state().roots.get(parent_id.name()) {
             None => anyhow::bail!(
@@ -833,6 +864,23 @@ impl Proc {
             Some(next_pid) => next_pid.fetch_add(1, Ordering::Relaxed),
         };
         Ok(parent_id.child_id(pid))
+    }
+
+    /// Allocate an actor ID with a custom name on this proc.
+    ///
+    /// See AI-1 (named-child pid) and AI-3 (controller ActorId
+    /// uniqueness) in module doc.
+    pub(crate) fn allocate_named_child_id(
+        &self,
+        parent_id: &reference::ActorId,
+        name: &str,
+    ) -> Result<reference::ActorId, anyhow::Error> {
+        let inherited = self.allocate_child_id(parent_id)?;
+        Ok(reference::ActorId::new(
+            inherited.proc_id().clone(),
+            name,
+            inherited.pid(),
+        ))
     }
 
     /// Downgrade to a weak reference that doesn't prevent the proc from being dropped.
@@ -992,7 +1040,7 @@ struct InstanceState<A: Actor> {
 }
 
 impl<A: Actor> InstanceState<A> {
-    fn self_id(&self) -> &ActorId {
+    fn self_id(&self) -> &reference::ActorId {
         self.mailbox.actor_id()
     }
 }
@@ -1021,12 +1069,9 @@ impl<A: Actor> Drop for InstanceState<A> {
 /// Receivers created by [`Instance::new`] that must be threaded to
 /// their respective consumers (actor loop, introspect task, etc.).
 ///
-/// # Invariant S10
+/// # Invariant
 ///
-/// The introspect receiver is created for every instance in
-/// `Instance::new()`. Callers that run a message loop (`start()`)
-/// spawn the introspect task. `child_instance()` intentionally
-/// drops the receiver.
+/// See S10 in `introspect` module doc.
 pub struct InstanceReceivers<A: Actor> {
     /// Signal and supervision receivers for the actor loop. `None`
     /// for detached/client instances that don't run an actor loop.
@@ -1041,7 +1086,7 @@ impl<A: Actor> Instance<A> {
     /// Create a new actor instance in Created state.
     fn new(
         proc: Proc,
-        actor_id: ActorId,
+        actor_id: reference::ActorId,
         detached: bool,
         parent: Option<InstanceCell>,
     ) -> (Self, InstanceReceivers<A>) {
@@ -1078,12 +1123,7 @@ impl<A: Actor> Instance<A> {
         // creation. bind_actor_port() registers in the mailbox
         // dispatch table at IntrospectMessage::port().
         //
-        // Invariant S3: senders target IntrospectMessage::port() — the
-        // same PortId used here — so routing is unchanged across processes.
-        // Invariant S4: pre-registration ensures no WorkCell creation
-        // for IntrospectMessage -- the port gets its own channel.
-        // Invariant S9: port bound exactly once here via
-        // bind_actor_port(); no other site calls bind for this port.
+        // Exercises S3, S4, S9 (see introspect module doc).
         let (introspect_port, introspect_receiver) =
             ports.open_message_port::<IntrospectMessage>().unwrap();
         introspect_port.bind_actor_port();
@@ -1160,11 +1200,12 @@ impl<A: Actor> Instance<A> {
                 caller = %Location::caller(),
                 change_reason,
             );
+            let actor_id = hash_to_u64(self.self_id());
             notify_actor_status_changed(ActorStatusEvent {
-                actor_id: self.self_id().to_string(),
-                timestamp: RealClock.system_time_now(),
+                id: generate_actor_status_event_id(actor_id),
+                timestamp: std::time::SystemTime::now(),
+                actor_id,
                 new_status: new_status.to_string(),
-                prev_status: old.arm().unwrap_or("Unknown").to_string(),
                 reason: if change_reason.is_empty() {
                     None
                 } else {
@@ -1183,13 +1224,13 @@ impl<A: Actor> Instance<A> {
     }
 
     /// This instance's actor ID.
-    pub fn self_id(&self) -> &ActorId {
+    pub fn self_id(&self) -> &reference::ActorId {
         self.inner.self_id()
     }
 
     /// Snapshot of this actor's introspection payload.
     ///
-    /// Returns a [`NodePayload`] built from live [`InstanceCell`]
+    /// Returns an [`IntrospectResult`] built from live [`InstanceCell`]
     /// state, without going through the actor message loop. This is
     /// safe to call from within a handler on the same actor (no
     /// self-send deadlock).
@@ -1202,31 +1243,59 @@ impl<A: Actor> Instance<A> {
     /// Note: this acquires a write lock on the flight recorder spool
     /// and clones its contents. Suitable for occasional introspection
     /// requests, not for hot paths.
-    pub fn introspect_payload(&self) -> crate::introspect::NodePayload {
+    pub fn introspect_payload(&self) -> crate::introspect::IntrospectResult {
         crate::introspect::live_actor_payload(&self.inner.cell)
     }
 
     /// Publish domain-specific properties for introspection.
     ///
-    /// Infrastructure actors call this to make their managed-entity
-    /// metadata (host address, proc count, custom children) visible
-    /// to admin tooling without going through the actor's message
-    /// handler. The timestamp is set automatically.
+    /// Publish a complete Attrs bag for introspection. Replaces any
+    /// previously published attrs.
     ///
-    /// Values may be arbitrarily stale for stuck actors — they
-    /// reflect the last time this method was called.
+    /// Debug builds assert that every key in the bag is tagged with
+    /// the `INTROSPECT` meta-attribute.
+    pub fn publish_attrs(&self, attrs: hyperactor_config::Attrs) {
+        #[cfg(debug_assertions)]
+        {
+            use std::collections::HashSet;
+            use std::sync::OnceLock;
+
+            use hyperactor_config::attrs::AttrKeyInfo;
+
+            static INTROSPECT_KEYS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+            let allowed = INTROSPECT_KEYS.get_or_init(|| {
+                inventory::iter::<AttrKeyInfo>()
+                    .filter(|info| info.meta.get(hyperactor_config::INTROSPECT).is_some())
+                    .map(|info| info.name)
+                    .collect()
+            });
+            for (name, _) in attrs.iter() {
+                debug_assert!(
+                    allowed.contains(name),
+                    "publish_attrs: key {:?} is not tagged with INTROSPECT",
+                    name
+                );
+            }
+        }
+        self.inner.cell.set_published_attrs(attrs);
+    }
+
+    /// Publish a single attr key-value pair for introspection. Merges
+    /// into existing published attrs (insert or overwrite).
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// cx.publish_properties(PublishedPropertiesKind::Host {
-    ///     addr: "127.0.0.1:8080".into(),
-    ///     num_procs: 2,
-    ///     children: vec!["proc_a".into(), "proc_b".into()],
-    /// });
-    /// ```
-    pub fn publish_properties(&self, kind: PublishedPropertiesKind) {
-        self.inner.cell.set_published_properties(kind);
+    /// Debug builds assert that the key is tagged with the
+    /// `INTROSPECT` meta-attribute.
+    pub fn publish_attr<T: hyperactor_config::AttrValue>(
+        &self,
+        key: hyperactor_config::Key<T>,
+        value: T,
+    ) {
+        debug_assert!(
+            key.attrs().get(hyperactor_config::INTROSPECT).is_some(),
+            "publish_attr called with non-introspection key: {}",
+            key.name()
+        );
+        self.inner.cell.merge_published_attr(key, value);
     }
 
     /// Mark this actor as system/infrastructure. System actors are
@@ -1249,7 +1318,7 @@ impl<A: Actor> Instance<A> {
     /// procs that have no independent `ProcAgent`.
     pub fn set_query_child_handler(
         &self,
-        handler: impl (Fn(&crate::reference::Reference) -> NodePayload) + Send + Sync + 'static,
+        handler: impl (Fn(&crate::reference::Reference) -> IntrospectResult) + Send + Sync + 'static,
     ) {
         self.inner.cell.set_query_child_handler(handler);
     }
@@ -1297,7 +1366,7 @@ impl<A: Actor> Instance<A> {
     }
 
     /// Send a message to the actor running on the proc.
-    pub fn post(&self, port_id: PortId, headers: Flattrs, message: wirevalue::Any) {
+    pub fn post(&self, port_id: reference::PortId, headers: Flattrs, message: wirevalue::Any) {
         <Self as context::MailboxExt>::post(
             self,
             port_id,
@@ -1316,7 +1385,7 @@ impl<A: Actor> Instance<A> {
     #[doc(hidden)]
     pub fn post_with_external_seq_info(
         &self,
-        port_id: PortId,
+        port_id: reference::PortId,
         headers: Flattrs,
         message: wirevalue::Any,
     ) {
@@ -1343,9 +1412,8 @@ impl<A: Actor> Instance<A> {
             .0;
         let port = self.port();
         let self_id = self.self_id().clone();
-        let clock = self.inner.proc.state().clock.clone();
         tokio::spawn(async move {
-            clock.non_advancing_sleep(delay).await;
+            tokio::time::sleep(delay).await;
             if let Err(e) = port.send(&client, message) {
                 // TODO: this is a fire-n-forget thread. We need to
                 // handle errors in a better way.
@@ -1539,10 +1607,7 @@ impl<A: Actor> Instance<A> {
 
         let (mut signal_receiver, _) = actor_loop_receivers;
         while self.inner.cell.child_count() > 0 {
-            match RealClock
-                .timeout(Duration::from_millis(500), signal_receiver.recv())
-                .await
-            {
+            match tokio::time::timeout(Duration::from_millis(500), signal_receiver.recv()).await {
                 Ok(signal) => {
                     if let Signal::ChildStopped(pid) = signal? {
                         assert!(self.inner.cell.get_child(pid).is_none());
@@ -1567,8 +1632,7 @@ impl<A: Actor> Instance<A> {
         // the GIL.
         let cleanup_result = if !did_panic {
             let cleanup_timeout = hyperactor_config::global::get(config::CLEANUP_TIMEOUT);
-            match RealClock
-                .timeout(cleanup_timeout, actor.cleanup(self, result.as_ref().err()))
+            match tokio::time::timeout(cleanup_timeout, actor.cleanup(self, result.as_ref().err()))
                 .await
             {
                 Ok(Ok(x)) => Ok(x),
@@ -1721,7 +1785,6 @@ impl<A: Actor> Instance<A> {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip_all)]
     async unsafe fn handle_message<M: Message>(
         &self,
         actor: &mut A,
@@ -1737,22 +1800,64 @@ impl<A: Actor> Instance<A> {
             Some(info) => {
                 // SAFETY: The caller promises to pass the correct type info.
                 let arm = unsafe { info.arm_unchecked(&message as *const M as *const ()) };
-                Some(HandlerInfo::from_static(info.typename(), arm))
+                HandlerInfo::from_static(info.typename(), arm)
             }
             None => {
                 // Fall back to std::any::type_name (also static, zero-copy).
-                Some(HandlerInfo::from_static(std::any::type_name::<M>(), None))
+                HandlerInfo::from_static(std::any::type_name::<M>(), None)
             }
         };
+        // Use a helper function for a better instrument log.
+        self.handle_message_with_handler_info(actor, handler_info, headers, message)
+            .await
+    }
 
-        self.change_status(ActorStatus::Processing(
-            self.clock().system_time_now(),
-            handler_info.clone(),
-        ));
+    // Skip serializing all fields except HandlerInfo which includes the typename.
+    #[tracing::instrument(level = "debug", name = "handle_message", skip_all, fields(actor_id = %self.self_id(), message_type = %handler_info))]
+    async fn handle_message_with_handler_info<M: Message>(
+        &self,
+        actor: &mut A,
+        handler_info: HandlerInfo,
+        headers: Flattrs,
+        message: M,
+    ) -> Result<(), anyhow::Error>
+    where
+        A: Handler<M>,
+    {
+        let now = std::time::SystemTime::now();
+        let handler_info = Some(handler_info);
+        self.change_status(ActorStatus::Processing(now, handler_info.clone()));
         crate::mailbox::headers::log_message_latency_if_sampling(
             &headers,
             self.self_id().to_string(),
         );
+
+        let message_id = headers.get(crate::mailbox::headers::TELEMETRY_MESSAGE_ID);
+
+        if let Some(message_id) = message_id {
+            let from_actor_id = headers
+                .get(crate::mailbox::headers::SENDER_ACTOR_ID_HASH)
+                .unwrap_or(0);
+            let to_actor_id = hash_to_u64(self.self_id());
+            let port_id = headers.get(crate::mailbox::headers::TELEMETRY_PORT_ID);
+
+            notify_message(hyperactor_telemetry::MessageEvent {
+                timestamp: now,
+                id: message_id,
+                from_actor_id,
+                to_actor_id,
+                // TODO: populate endpoint
+                endpoint: None,
+                port_id,
+            });
+
+            notify_message_status(hyperactor_telemetry::MessageStatusEvent {
+                timestamp: now,
+                id: hyperactor_telemetry::generate_status_event_id(message_id),
+                message_id,
+                status: "active".to_string(),
+            });
+        }
 
         // Record the message handler being invoked.
         *self.inner.cell.inner.last_message_handler.write().unwrap() = handler_info;
@@ -1772,12 +1877,35 @@ impl<A: Actor> Instance<A> {
             .inner
             .total_processing_time_us
             .fetch_add(elapsed_us, Ordering::SeqCst);
+
+        if let Some(message_id) = message_id {
+            notify_message_status(hyperactor_telemetry::MessageStatusEvent {
+                timestamp: std::time::SystemTime::now(),
+                id: hyperactor_telemetry::generate_status_event_id(message_id),
+                message_id,
+                status: "complete".to_string(),
+            });
+        }
+
         result
     }
 
     /// Spawn on child on this instance.
     pub fn spawn<C: Actor>(&self, actor: C) -> anyhow::Result<ActorHandle<C>> {
         self.inner.proc.spawn_child(self.inner.cell.clone(), actor)
+    }
+
+    /// Spawn a named child actor on this instance. The child gets a
+    /// descriptive name in its ActorId instead of inheriting this
+    /// instance's name. Supervision linkage is preserved.
+    pub fn spawn_with_name<C: Actor>(
+        &self,
+        name: &str,
+        actor: C,
+    ) -> anyhow::Result<ActorHandle<C>> {
+        self.inner
+            .proc
+            .spawn_named_child(self.inner.cell.clone(), name, actor)
     }
 
     /// Create a new direct child instance.
@@ -1800,7 +1928,7 @@ impl<A: Actor> Instance<A> {
     }
 
     /// The owning actor ref.
-    pub fn bind<R: Binds<A>>(&self) -> ActorRef<R> {
+    pub fn bind<R: Binds<A>>(&self) -> reference::ActorRef<R> {
         self.inner.cell.bind(self.inner.ports.as_ref())
     }
 
@@ -1808,11 +1936,6 @@ impl<A: Actor> Instance<A> {
     #[doc(hidden)]
     pub fn mailbox_for_py(&self) -> &Mailbox {
         &self.inner.mailbox
-    }
-
-    /// A reference to the proc's clock
-    pub fn clock(&self) -> &(impl Clock + use<A>) {
-        &self.inner.proc.state().clock
     }
 
     /// The owning proc.
@@ -1956,7 +2079,7 @@ impl fmt::Debug for InstanceCell {
 
 struct InstanceCellState {
     /// The actor's id.
-    actor_id: ActorId,
+    actor_id: reference::ActorId,
 
     /// Actor info contains the actor's type information.
     actor_type: ActorType,
@@ -1974,7 +2097,7 @@ struct InstanceCellState {
     parent: WeakInstanceCell,
 
     /// This instance's children by their PIDs.
-    children: DashMap<Index, InstanceCell>,
+    children: DashMap<reference::Index, InstanceCell>,
 
     /// Access to the spawned actor's join handle.
     actor_task_handle: OnceLock<JoinHandle<()>>,
@@ -1998,18 +2121,15 @@ struct InstanceCellState {
     /// store a 'flight record' of events while the actor is running.
     recording: Recording,
 
-    /// Domain-specific properties published by the actor for
-    /// introspection. Written by the actor via
-    /// `Instance::publish_properties()`; read by the introspection
-    /// runtime handler. `None` means the actor has not published
-    /// custom properties — the runtime handler falls back to
-    /// `NodeProperties::Actor`.
+    /// Attrs-based introspection data published by the actor. Written
+    /// by the actor via `Instance::publish_attrs()` /
+    /// `Instance::publish_attr()`, and read by the introspection
+    /// runtime handler when building node payloads.
     ///
-    /// Invariant S8: only `Host` and `Proc` variants are accepted
-    /// (no `Root` or `Error`).
-    /// Invariant S6: Entity view reads from this field; Actor view
-    /// reads live state from `InstanceCell`.
-    published_properties: RwLock<Option<crate::introspect::PublishedProperties>>,
+    /// This bag may contain both mesh-level keys (`node_type`,
+    /// `addr`, `num_procs`, ...) and actor-runtime keys (`status`,
+    /// `messages_processed`, ...).
+    published_attrs: RwLock<Option<hyperactor_config::Attrs>>,
 
     /// Optional callback for resolving non-addressable children
     /// (e.g., system procs). Registered by infrastructure actors
@@ -2017,16 +2137,13 @@ struct InstanceCellState {
     /// introspection runtime handler for `QueryChild` messages.
     /// `None` means `QueryChild` returns a "not_found" error.
     ///
-    /// Invariant S7: system procs are resolvable without entering
-    /// the actor loop — the callback runs on the introspect task.
-    query_child_handler:
-        RwLock<Option<Box<dyn (Fn(&crate::reference::Reference) -> NodePayload) + Send + Sync>>>,
+    /// See S7 in `introspect` module doc.
+    query_child_handler: RwLock<
+        Option<Box<dyn (Fn(&crate::reference::Reference) -> IntrospectResult) + Send + Sync>>,
+    >,
 
-    /// The supervision event produced when this actor failed, if any.
-    /// Written in `serve()` BEFORE `change_status()` transitions to
-    /// terminal, so that `serve_introspect` sees it when
-    /// `wait_for(is_terminal)` fires. `None` for actors that stopped
-    /// cleanly. Write-once per actor lifetime (FI-2).
+    /// The supervision event for this actor's failure, if any.
+    /// See FI-1, FI-2 in `introspect` module doc.
     supervision_event: std::sync::Mutex<Option<crate::supervision::ActorSupervisionEvent>>,
 
     /// Whether this actor is infrastructure/system (hidden by default
@@ -2068,11 +2185,11 @@ impl InstanceCellState {
 ///    newest-first (descending `occurred_at`), preserving the
 ///    earliest failures which are closest to the root cause.
 fn select_eviction_candidates(
-    entries: &[(ActorId, Option<String>)],
+    entries: &[(reference::ActorId, Option<String>)],
     excess: usize,
-) -> Vec<ActorId> {
-    let mut clean: Vec<&ActorId> = Vec::new();
-    let mut failed: Vec<(&ActorId, &str)> = Vec::new();
+) -> Vec<reference::ActorId> {
+    let mut clean: Vec<&reference::ActorId> = Vec::new();
+    let mut failed: Vec<(&reference::ActorId, &str)> = Vec::new();
     for (id, occurred_at) in entries {
         match occurred_at {
             Some(ts) => failed.push((id, ts.as_str())),
@@ -2080,7 +2197,7 @@ fn select_eviction_candidates(
         }
     }
 
-    let mut to_remove: Vec<ActorId> = Vec::new();
+    let mut to_remove: Vec<reference::ActorId> = Vec::new();
     let mut remaining = excess;
 
     // Evict cleanly-stopped first.
@@ -2107,7 +2224,7 @@ impl InstanceCell {
     /// Creates a new instance cell with the provided internal state. If a parent
     /// is provided, it is linked to this cell.
     fn new(
-        actor_id: ActorId,
+        actor_id: reference::ActorId,
         actor_type: ActorType,
         proc: Proc,
         actor_loop: Option<(PortHandle<Signal>, PortHandle<ActorSupervisionEvent>)>,
@@ -2128,11 +2245,11 @@ impl InstanceCell {
                 actor_task_handle: OnceLock::new(),
                 exported_named_ports: DashMap::new(),
                 num_processed_messages: AtomicU64::new(0),
-                created_at: RealClock.system_time_now(),
+                created_at: std::time::SystemTime::now(),
                 last_message_handler: RwLock::new(None),
                 total_processing_time_us: AtomicU64::new(0),
                 recording: hyperactor_telemetry::recorder().record(64),
-                published_properties: RwLock::new(None),
+                published_attrs: RwLock::new(None),
                 query_child_handler: RwLock::new(None),
                 supervision_event: std::sync::Mutex::new(None),
                 is_system: AtomicBool::new(false),
@@ -2151,12 +2268,12 @@ impl InstanceCell {
     }
 
     /// The actor's ID.
-    pub fn actor_id(&self) -> &ActorId {
+    pub fn actor_id(&self) -> &reference::ActorId {
         &self.inner.actor_id
     }
 
     /// The actor's PID.
-    pub(crate) fn pid(&self) -> Index {
+    pub(crate) fn pid(&self) -> reference::Index {
         self.inner.actor_id.pid()
     }
 
@@ -2270,7 +2387,7 @@ impl InstanceCell {
 
     /// Return an iterator over this instance's children. This may deadlock if the
     /// caller already holds a reference to any item in map.
-    fn child_iter(&self) -> impl Iterator<Item = RefMulti<'_, Index, InstanceCell>> {
+    fn child_iter(&self) -> impl Iterator<Item = RefMulti<'_, reference::Index, InstanceCell>> {
         self.inner.children.iter()
     }
 
@@ -2280,7 +2397,7 @@ impl InstanceCell {
     }
 
     /// Returns the ActorIds of this instance's direct children.
-    pub fn child_actor_ids(&self) -> Vec<ActorId> {
+    pub fn child_actor_ids(&self) -> Vec<reference::ActorId> {
         self.inner
             .children
             .iter()
@@ -2289,7 +2406,7 @@ impl InstanceCell {
     }
 
     /// Get a child by its PID.
-    fn get_child(&self, pid: Index) -> Option<InstanceCell> {
+    fn get_child(&self, pid: reference::Index) -> Option<InstanceCell> {
         self.inner.children.get(&pid).map(|child| child.clone())
     }
 
@@ -2328,23 +2445,29 @@ impl InstanceCell {
         self.inner.actor_type.type_name()
     }
 
-    /// Set the domain-specific properties published by this actor for
-    /// introspection. The `published_at` timestamp is set
-    /// automatically to `RealClock.system_time_now()`.
-    ///
-    /// Infrastructure actors (HostAgent, ProcAgent) call this
-    /// to make their managed-entity metadata available without going
-    /// through the actor's message handler.
-    pub fn set_published_properties(&self, kind: PublishedPropertiesKind) {
-        *self.inner.published_properties.write().unwrap() = Some(PublishedProperties {
-            published_at: RealClock.system_time_now(),
-            kind,
-        });
+    /// Replace the published introspection attrs with a new bag.
+    pub fn set_published_attrs(&self, attrs: hyperactor_config::Attrs) {
+        *self.inner.published_attrs.write().unwrap() = Some(attrs);
     }
 
-    /// Read the last-published domain-specific properties, if any.
-    pub fn published_properties(&self) -> Option<PublishedProperties> {
-        self.inner.published_properties.read().unwrap().clone()
+    /// Set a single introspection attr, merging into the existing bag
+    /// (or creating one if none exists).
+    pub fn merge_published_attr<T: hyperactor_config::AttrValue>(
+        &self,
+        key: hyperactor_config::Key<T>,
+        value: T,
+    ) {
+        self.inner
+            .published_attrs
+            .write()
+            .unwrap()
+            .get_or_insert_with(hyperactor_config::Attrs::new)
+            .set(key, value);
+    }
+
+    /// Read the published introspection attrs, if any.
+    pub fn published_attrs(&self) -> Option<hyperactor_config::Attrs> {
+        self.inner.published_attrs.read().unwrap().clone()
     }
 
     /// Register a callback for resolving non-addressable children
@@ -2356,13 +2479,13 @@ impl InstanceCell {
     /// Capture cloned `Proc` references, not `&mut self`.
     pub fn set_query_child_handler(
         &self,
-        handler: impl (Fn(&crate::reference::Reference) -> NodePayload) + Send + Sync + 'static,
+        handler: impl (Fn(&crate::reference::Reference) -> IntrospectResult) + Send + Sync + 'static,
     ) {
         *self.inner.query_child_handler.write().unwrap() = Some(Box::new(handler));
     }
 
     /// Invoke the registered QueryChild handler, if any.
-    pub fn query_child(&self, child_ref: &crate::reference::Reference) -> Option<NodePayload> {
+    pub fn query_child(&self, child_ref: &crate::reference::Reference) -> Option<IntrospectResult> {
         let guard = self.inner.query_child_handler.read().unwrap();
         guard.as_ref().map(|handler| handler(child_ref))
     }
@@ -2381,7 +2504,7 @@ impl InstanceCell {
     /// 2. When only failed actors remain, evict the most recent
     ///    (by `occurred_at`), preserving the earliest failures
     ///    which are closest to the root cause.
-    pub fn store_terminated_snapshot(&self, payload: crate::introspect::NodePayload) {
+    pub fn store_terminated_snapshot(&self, payload: crate::introspect::IntrospectResult) {
         let snapshots = &self.inner.proc.inner.terminated_snapshots;
         snapshots.insert(self.actor_id().clone(), payload);
         let max = hyperactor_config::global::get(crate::config::TERMINATED_SNAPSHOT_RETENTION);
@@ -2391,13 +2514,19 @@ impl InstanceCell {
             let entries: Vec<_> = snapshots
                 .iter()
                 .map(|entry| {
-                    let occurred_at = match &entry.value().properties {
-                        crate::introspect::NodeProperties::Actor {
-                            failure_info: Some(fi),
-                            ..
-                        } => Some(fi.occurred_at.clone()),
-                        _ => None,
-                    };
+                    let occurred_at =
+                        serde_json::from_str::<hyperactor_config::Attrs>(&entry.value().attrs)
+                            .ok()
+                            .and_then(|attrs| {
+                                // Presence of FAILURE_ERROR_MESSAGE means the actor failed.
+                                attrs
+                                    .get(crate::introspect::FAILURE_ERROR_MESSAGE)
+                                    .cloned()?;
+                                // Extract occurred_at timestamp for sorting.
+                                attrs
+                                    .get(crate::introspect::FAILURE_OCCURRED_AT)
+                                    .map(|t| humantime::format_rfc3339(*t).to_string())
+                            });
                     (entry.key().clone(), occurred_at)
                 })
                 .collect();
@@ -2410,7 +2539,7 @@ impl InstanceCell {
 
     /// This is temporary so that we can share binding code between handle and instance.
     /// We should find some (better) way to consolidate the two.
-    pub(crate) fn bind<A: Actor, R: Binds<A>>(&self, ports: &Ports<A>) -> ActorRef<R> {
+    pub(crate) fn bind<A: Actor, R: Binds<A>>(&self, ports: &Ports<A>) -> reference::ActorRef<R> {
         <R as Binds<A>>::bind(ports);
         // Signal: pre-registered via open_message_port() in
         // Instance::new(), handled by the actor loop's select!.
@@ -2431,7 +2560,7 @@ impl InstanceCell {
                 .exported_named_ports
                 .insert(*entry.key(), entry.value());
         }
-        ActorRef::attest(self.actor_id().clone())
+        reference::ActorRef::attest(self.actor_id().clone())
     }
 
     /// Attempt to downcast this cell to a concrete actor handle.
@@ -2668,9 +2797,6 @@ mod tests {
     use crate as hyperactor;
     use crate::HandleClient;
     use crate::Handler;
-    use crate::OncePortRef;
-    use crate::PortRef;
-    use crate::clock::RealClock;
     use crate::testing::proc_supervison::ProcSupervisionCoordinator;
     use crate::testing::process_assertion::assert_termination;
 
@@ -2805,7 +2931,7 @@ mod tests {
             .send(&client, TestActorMessage::Wait(enter_tx, exit_rx))
             .unwrap();
         enter_rx.await.unwrap();
-        assert_matches!(*state.borrow(), ActorStatus::Processing(instant, _) if instant <= RealClock.system_time_now());
+        assert_matches!(*state.borrow(), ActorStatus::Processing(instant, _) if instant <= std::time::SystemTime::now());
         exit_tx.send(()).unwrap();
 
         state
@@ -2843,7 +2969,10 @@ mod tests {
 
     #[derive(Handler, HandleClient, Debug)]
     enum LookupTestMessage {
-        ActorExists(ActorRef<TestActor>, #[reply] OncePortRef<bool>),
+        ActorExists(
+            reference::ActorRef<TestActor>,
+            #[reply] reference::OncePortRef<bool>,
+        ),
     }
 
     #[async_trait]
@@ -2852,7 +2981,7 @@ mod tests {
         async fn actor_exists(
             &mut self,
             cx: &crate::Context<Self>,
-            actor_ref: ActorRef<TestActor>,
+            actor_ref: reference::ActorRef<TestActor>,
         ) -> Result<bool, anyhow::Error> {
             Ok(actor_ref.downcast_handle(cx).is_some())
         }
@@ -2881,7 +3010,7 @@ mod tests {
             !lookup_actor
                 .actor_exists(
                     &client,
-                    ActorRef::attest(target_actor.actor_id().child_id(123).clone())
+                    reference::ActorRef::attest(target_actor.actor_id().child_id(123).clone())
                 )
                 .await
                 .unwrap()
@@ -2889,7 +3018,10 @@ mod tests {
         // A wrongly-typed actor ref should also not obtain.
         assert!(
             !lookup_actor
-                .actor_exists(&client, ActorRef::attest(lookup_actor.actor_id().clone()))
+                .actor_exists(
+                    &client,
+                    reference::ActorRef::attest(lookup_actor.actor_id().clone())
+                )
                 .await
                 .unwrap()
         );
@@ -3226,7 +3358,7 @@ mod tests {
             .send::<String>(&client, "some random failure".into())
             .unwrap();
 
-        RealClock.sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert!(!root_state.load(Ordering::SeqCst));
         assert!(root_1_state.load(Ordering::SeqCst));
@@ -3248,11 +3380,11 @@ mod tests {
         impl Actor for TestActor {}
 
         #[async_trait]
-        impl Handler<(String, PortRef<String>)> for TestActor {
+        impl Handler<(String, reference::PortRef<String>)> for TestActor {
             async fn handle(
                 &mut self,
                 cx: &crate::Context<Self>,
-                (message, port): (String, PortRef<String>),
+                (message, port): (String, reference::PortRef<String>),
             ) -> anyhow::Result<()> {
                 port.send(cx, message)?;
                 Ok(())
@@ -3302,7 +3434,7 @@ mod tests {
             // It is okay to sleep a long time here, because we expect this
             // process to be terminated way before the sleep ends due to the
             // missing proc supervison coordinator.
-            RealClock.sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
         };
 
         assert_termination(|| process, 1).await.unwrap();
@@ -3503,8 +3635,8 @@ mod tests {
     /// have stored the snapshot by the time `handle.await` returns.
     async fn wait_for_terminated_snapshot(
         proc: &Proc,
-        actor_id: &ActorId,
-    ) -> crate::introspect::NodePayload {
+        actor_id: &reference::ActorId,
+    ) -> crate::introspect::IntrospectResult {
         // Yield to let the introspect task run, then poll. Use a
         // combination of yields (for fast paths) and sleeps (to
         // avoid busy-spinning if the scheduler is loaded).
@@ -3515,7 +3647,7 @@ mod tests {
             if i < 50 {
                 tokio::task::yield_now().await;
             } else {
-                RealClock.sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
         panic!("timed out waiting for terminated snapshot for {}", actor_id);
@@ -3548,10 +3680,15 @@ mod tests {
         // The introspect task runs in a separate tokio task; wait for
         // it to observe the terminal status and store the snapshot.
         let snapshot = wait_for_terminated_snapshot(&proc, &actor_id).await;
-        assert_matches!(
-            &snapshot.properties,
-            crate::introspect::NodeProperties::Actor { actor_status, .. }
-                if actor_status.starts_with("stopped:")
+        let attrs: hyperactor_config::Attrs =
+            serde_json::from_str(&snapshot.attrs).expect("attrs must be valid JSON");
+        let status = attrs
+            .get(crate::introspect::STATUS)
+            .expect("must have status");
+        assert!(
+            status.starts_with("stopped"),
+            "expected stopped status, got: {}",
+            status
         );
 
         // Actor should appear in terminated IDs but not in live IDs.
@@ -3585,16 +3722,19 @@ mod tests {
         handle.await;
 
         let snapshot = wait_for_terminated_snapshot(&proc, &actor_id).await;
-        assert_matches!(
-            &snapshot.properties,
-            crate::introspect::NodeProperties::Actor { actor_status, .. }
-                if actor_status.starts_with("failed:")
+        let attrs: hyperactor_config::Attrs =
+            serde_json::from_str(&snapshot.attrs).expect("attrs must be valid JSON");
+        let status = attrs
+            .get(crate::introspect::STATUS)
+            .expect("must have status");
+        assert!(
+            status.starts_with("failed"),
+            "expected failed status, got: {}",
+            status
         );
     }
 
-    // Invariant FI-1/FI-2: supervision_event is stored on the
-    // InstanceCell when an actor fails and is readable after
-    // termination.
+    // Exercises FI-1/FI-2 (see introspect.rs module-scope comment).
     #[async_timed_test(timeout_secs = 30)]
     async fn test_supervision_event_stored_on_failure() {
         let proc = Proc::local();
@@ -3619,7 +3759,7 @@ mod tests {
         assert_eq!(event.actually_failing_actor().actor_id, actor_id);
     }
 
-    // Invariant FI-2/INV-6: clean stop produces no supervision_event.
+    // Exercises FI-2 (see introspect.rs module-scope comment).
     #[async_timed_test(timeout_secs = 30)]
     async fn test_supervision_event_none_on_clean_stop() {
         let proc = Proc::local();
@@ -3637,8 +3777,7 @@ mod tests {
         );
     }
 
-    // Invariant: propagated failures carry the originating actor's
-    // identity through actually_failing_actor().
+    // Exercises FI-4 (see introspect.rs module-scope comment).
     #[async_timed_test(timeout_secs = 30)]
     async fn test_supervision_event_on_propagated_failure() {
         let proc = Proc::local();
@@ -3673,7 +3812,7 @@ mod tests {
         assert_eq!(event.actually_failing_actor().actor_id, child_id);
     }
 
-    // Invariant: resolve_actor_ref returns None for terminal actors.
+    // Exercises S11 (see introspect.rs module doc).
     //
     // A live actor is resolvable. After drain_and_stop + await, the
     // actor's status is terminal and resolve_actor_ref must return
@@ -3687,7 +3826,7 @@ mod tests {
         let (_client, _client_handle) = proc.instance("client").unwrap();
 
         let handle = proc.spawn::<TestActor>("target", TestActor).unwrap();
-        let actor_ref: ActorRef<TestActor> = handle.bind();
+        let actor_ref: reference::ActorRef<TestActor> = handle.bind();
 
         // Actor is live — resolve should succeed.
         assert!(
@@ -3706,7 +3845,7 @@ mod tests {
         );
     }
 
-    // INV-3: terminated snapshot for a failed actor has failure_info.
+    // Exercises FI-3 (see introspect module doc).
     #[async_timed_test(timeout_secs = 30)]
     async fn test_terminated_snapshot_has_failure_info() {
         let proc = Proc::local();
@@ -3722,26 +3861,35 @@ mod tests {
         handle.await;
 
         let snapshot = wait_for_terminated_snapshot(&proc, &actor_id).await;
-        match &snapshot.properties {
-            crate::introspect::NodeProperties::Actor {
-                actor_status,
-                failure_info,
-                ..
-            } => {
-                assert!(actor_status.starts_with("failed:"));
-                let info = failure_info
-                    .as_ref()
-                    .expect("failed actor snapshot must have failure_info");
-                assert!(!info.error_message.is_empty());
-                assert_eq!(info.root_cause_actor, actor_id.to_string());
-                assert!(!info.is_propagated);
-                assert!(!info.occurred_at.is_empty());
-            }
-            other => panic!("expected NodeProperties::Actor, got {:?}", other),
-        }
+        let attrs: hyperactor_config::Attrs =
+            serde_json::from_str(&snapshot.attrs).expect("attrs must be valid JSON");
+        let status = attrs
+            .get(crate::introspect::STATUS)
+            .expect("must have status");
+        assert!(
+            status.starts_with("failed"),
+            "expected failed status, got: {}",
+            status
+        );
+        let err_msg = attrs
+            .get(crate::introspect::FAILURE_ERROR_MESSAGE)
+            .expect("failed actor must have failure_error_message");
+        assert!(!err_msg.is_empty());
+        let root_cause = attrs
+            .get(crate::introspect::FAILURE_ROOT_CAUSE_ACTOR)
+            .expect("must have root_cause_actor");
+        assert_eq!(root_cause, &actor_id.to_string());
+        assert_eq!(
+            attrs.get(crate::introspect::FAILURE_IS_PROPAGATED),
+            Some(&false)
+        );
+        assert!(
+            attrs.get(crate::introspect::FAILURE_OCCURRED_AT).is_some(),
+            "failed actor must have occurred_at"
+        );
     }
 
-    // INV-4: propagated failure has root_cause pointing to child.
+    // Exercises FI-4 (see introspect module doc).
     #[async_timed_test(timeout_secs = 30)]
     async fn test_propagated_failure_info() {
         let proc = Proc::local();
@@ -3765,19 +3913,164 @@ mod tests {
         parent.await;
 
         let snapshot = wait_for_terminated_snapshot(&proc, &parent_id).await;
-        match &snapshot.properties {
-            crate::introspect::NodeProperties::Actor { failure_info, .. } => {
-                let info = failure_info
-                    .as_ref()
-                    .expect("propagated failure must have failure_info");
-                assert_eq!(info.root_cause_actor, child_id.to_string());
-                assert!(info.is_propagated);
-            }
-            other => panic!("expected NodeProperties::Actor, got {:?}", other),
-        }
+        let attrs: hyperactor_config::Attrs =
+            serde_json::from_str(&snapshot.attrs).expect("attrs must be valid JSON");
+        let root_cause = attrs
+            .get(crate::introspect::FAILURE_ROOT_CAUSE_ACTOR)
+            .expect("propagated failure must have root_cause_actor");
+        assert_eq!(root_cause, &child_id.to_string());
+        assert_eq!(
+            attrs.get(crate::introspect::FAILURE_IS_PROPAGATED),
+            Some(&true)
+        );
     }
 
-    // INV-6: cleanly stopped actor has no failure_info.
+    /// Exercises AI-1 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_spawn_with_name_creates_descriptive_name() {
+        let proc = Proc::local();
+        let root = proc.spawn::<TestActor>("root", TestActor).unwrap();
+        let handle = proc
+            .spawn_named_child(root.cell().clone(), "my_controller", TestActor)
+            .unwrap();
+        assert_eq!(handle.actor_id().name(), "my_controller");
+        assert_eq!(handle.actor_id().pid(), 1);
+    }
+
+    /// Exercises AI-1 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_spawn_with_name_increments_index() {
+        let proc = Proc::local();
+        let root = proc.spawn::<TestActor>("root", TestActor).unwrap();
+        let first = proc
+            .spawn_named_child(root.cell().clone(), "my_controller", TestActor)
+            .unwrap();
+        let second = proc
+            .spawn_named_child(root.cell().clone(), "my_controller", TestActor)
+            .unwrap();
+        assert_eq!(first.actor_id().pid(), 1);
+        assert_eq!(second.actor_id().pid(), 2);
+    }
+
+    /// Exercises AI-1 (see module doc).
+    /// spawn_named_child passes Some(parent) to spawn_inner.
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_spawn_with_name_preserves_supervision() {
+        let proc = Proc::local();
+        let root = proc.spawn::<TestActor>("root", TestActor).unwrap();
+        let child = proc
+            .spawn_named_child(root.cell().clone(), "supervised_child", TestActor)
+            .unwrap();
+        let child_cell = child.cell();
+        let parent = child_cell.parent().expect("named child must have a parent");
+        assert_eq!(parent.actor_id(), root.actor_id());
+    }
+
+    /// Exercises AI-1 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_spawn_unchanged() {
+        let proc = Proc::local();
+        let root = proc.spawn::<TestActor>("root", TestActor).unwrap();
+        let child = proc.spawn_child(root.cell().clone(), TestActor).unwrap();
+        assert_eq!(child.actor_id().name(), root.actor_id().name());
+    }
+
+    /// Exercises AI-1 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_spawn_with_name_different_names_different_pids() {
+        let proc = Proc::local();
+        let root = proc.spawn::<TestActor>("root", TestActor).unwrap();
+        let a = proc
+            .spawn_named_child(root.cell().clone(), "controller_a", TestActor)
+            .unwrap();
+        let b = proc
+            .spawn_named_child(root.cell().clone(), "controller_b", TestActor)
+            .unwrap();
+        assert_ne!(a.actor_id().pid(), b.actor_id().pid());
+        assert_eq!(a.actor_id().name(), "controller_a");
+        assert_eq!(b.actor_id().name(), "controller_b");
+    }
+
+    /// Exercises AI-1 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_spawn_with_name_no_child_overwrite() {
+        let proc = Proc::local();
+        let root = proc.spawn::<TestActor>("root", TestActor).unwrap();
+        let _a = proc
+            .spawn_named_child(root.cell().clone(), "ctrl", TestActor)
+            .unwrap();
+        let _b = proc
+            .spawn_named_child(root.cell().clone(), "ctrl", TestActor)
+            .unwrap();
+        let _c = proc.spawn_child(root.cell().clone(), TestActor).unwrap();
+        assert_eq!(root.cell().child_count(), 3);
+    }
+
+    /// Exercises AI-1 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_spawn_with_name_does_not_pollute_roots() {
+        let proc = Proc::local();
+        let root = proc.spawn::<TestActor>("root", TestActor).unwrap();
+        let _child = proc
+            .spawn_named_child(root.cell().clone(), "foo", TestActor)
+            .unwrap();
+        // "foo" was used as a named child name but should NOT
+        // prevent spawning a root actor with that name.
+        let result = proc.spawn::<TestActor>("foo", TestActor);
+        assert!(result.is_ok(), "named child should not pollute roots");
+    }
+
+    /// Exercises AI-3 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_ai3_controller_actor_ids_unique_across_parents_same_proc() {
+        let proc = Proc::local();
+        let parent_a = proc.spawn::<TestActor>("parent_a", TestActor).unwrap();
+        let parent_b = proc.spawn::<TestActor>("parent_b", TestActor).unwrap();
+
+        // Simulate the correct pattern: include mesh identity in name.
+        let ctrl_a = proc
+            .spawn_named_child(parent_a.cell().clone(), "controller_mesh_a", TestActor)
+            .unwrap();
+        let ctrl_b = proc
+            .spawn_named_child(parent_b.cell().clone(), "controller_mesh_b", TestActor)
+            .unwrap();
+
+        assert_ne!(
+            ctrl_a.actor_id(),
+            ctrl_b.actor_id(),
+            "controller ActorIds must be unique across parents"
+        );
+    }
+
+    /// Exercises AI-3 (see module doc).
+    #[async_timed_test(timeout_secs = 30)]
+    async fn test_ai3_no_controller_overwrite_in_parent_or_proc_maps() {
+        let proc = Proc::local();
+        let parent_a = proc.spawn::<TestActor>("parent_a", TestActor).unwrap();
+        let parent_b = proc.spawn::<TestActor>("parent_b", TestActor).unwrap();
+
+        let ctrl_a = proc
+            .spawn_named_child(parent_a.cell().clone(), "controller_mesh_a", TestActor)
+            .unwrap();
+        let ctrl_b = proc
+            .spawn_named_child(parent_b.cell().clone(), "controller_mesh_b", TestActor)
+            .unwrap();
+
+        // Both must be independently resolvable via the proc's instances.
+        assert!(
+            proc.get_instance(ctrl_a.actor_id()).is_some(),
+            "ctrl_a must be resolvable"
+        );
+        assert!(
+            proc.get_instance(ctrl_b.actor_id()).is_some(),
+            "ctrl_b must be resolvable"
+        );
+        // Parents each see exactly one child.
+        assert_eq!(parent_a.cell().child_count(), 1);
+        assert_eq!(parent_b.cell().child_count(), 1);
+    }
+
+    // Exercises FI-6 (see introspect module doc).
     #[async_timed_test(timeout_secs = 30)]
     async fn test_stopped_snapshot_has_no_failure_info() {
         let proc = Proc::local();
@@ -3790,19 +4083,21 @@ mod tests {
         handle.await;
 
         let snapshot = wait_for_terminated_snapshot(&proc, &actor_id).await;
-        match &snapshot.properties {
-            crate::introspect::NodeProperties::Actor {
-                actor_status,
-                failure_info,
-                ..
-            } => {
-                assert!(actor_status.starts_with("stopped:"));
-                assert!(
-                    failure_info.is_none(),
-                    "stopped actor must not have failure_info"
-                );
-            }
-            other => panic!("expected NodeProperties::Actor, got {:?}", other),
-        }
+        let attrs: hyperactor_config::Attrs =
+            serde_json::from_str(&snapshot.attrs).expect("attrs must be valid JSON");
+        let status = attrs
+            .get(crate::introspect::STATUS)
+            .expect("must have status");
+        assert!(
+            status.starts_with("stopped"),
+            "expected stopped, got: {}",
+            status
+        );
+        assert!(
+            attrs
+                .get(crate::introspect::FAILURE_ERROR_MESSAGE)
+                .is_none(),
+            "stopped actor must not have failure attrs"
+        );
     }
 }

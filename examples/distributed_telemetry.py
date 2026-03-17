@@ -21,6 +21,13 @@ via the ActorEventSink.
 Usage:
     buck2 run //monarch/examples:distributed_telemetry
     buck2 run //monarch/examples:distributed_telemetry -- --summary
+    buck2 run //monarch/examples:distributed_telemetry -- --interactive
+
+To browse the dashboard interactively, use --interactive. This pauses after
+actors are spawned so you can open the dashboard in a browser:
+    buck2 run //monarch/examples:distributed_telemetry -- --interactive
+    # Then SSH-tunnel: ssh -L 8265:localhost:8265 <devserver>
+    # Open http://localhost:8265, press Ctrl+C to continue to queries.
 """
 
 import argparse
@@ -32,7 +39,7 @@ os.environ["USE_UNIFIED_LAYER"] = "true"
 
 import pyarrow as pa
 from monarch.actor import Actor, endpoint
-from monarch.distributed_telemetry import start_telemetry
+from monarch.distributed_telemetry.actor import start_telemetry
 from monarch.job import ProcessJob
 
 
@@ -281,9 +288,9 @@ QUERIES = [
     # Actor status events joined with actors
     (
         "Actor status timeline",
-        """SELECT a.full_name, s.new_status, s.prev_status, s.reason
+        """SELECT a.full_name, s.new_status, s.reason
            FROM actor_status_events s
-           JOIN actors a ON s.actor_id = a.full_name
+           JOIN actors a ON s.actor_id = a.id
            ORDER BY s.timestamp_us""",
     ),
     (
@@ -315,7 +322,8 @@ QUERIES = [
            FROM sent_messages sm
            LEFT JOIN meshes m ON sm.actor_mesh_id = m.id
            LEFT JOIN actors a ON sm.sender_actor_id = a.id
-           WHERE m.given_name = 'compute'""",
+           WHERE m.given_name = 'compute'
+           ORDER BY sm.timestamp_us DESC""",
     ),
     (
         "Sample sent messages",
@@ -325,6 +333,49 @@ QUERIES = [
            JOIN actors a ON sm.sender_actor_id = a.id
            ORDER BY sm.timestamp_us DESC
            LIMIT 10""",
+    ),
+    (
+        "Received Messages",
+        """SELECT m.id, m.timestamp_us, m.port_id,
+                  sender.full_name AS from_actor, receiver.full_name AS to_actor,
+           FROM messages m
+           LEFT JOIN actors sender ON m.from_actor_id = sender.id
+           LEFT JOIN actors receiver ON m.to_actor_id = receiver.id
+           ORDER BY m.timestamp_us
+           LIMIT 10""",
+    ),
+    (
+        "Messages received by 'compuate' actor mesh sent from 'sender' actor mesh",
+        """SELECT m.id, m.timestamp_us,
+                  sender.display_name AS from_actor, receiver.display_name AS to_actor,
+                  m.port_id
+           FROM messages m
+           JOIN actors sender ON m.from_actor_id = sender.id
+           JOIN actors receiver ON m.to_actor_id = receiver.id
+           JOIN meshes sm ON sender.mesh_id = sm.id
+           JOIN meshes rm ON receiver.mesh_id = rm.id
+           WHERE sm.given_name = 'sender' AND rm.given_name = 'compute'
+           ORDER BY m.timestamp_us DESC""",
+    ),
+    (
+        "Message Status Events",
+        "SELECT * FROM message_status_events ORDER BY timestamp_us LIMIT 10",
+    ),
+    (
+        "Lifecycle: sender -> compute messages",
+        """SELECT sender.display_name AS from_actor,
+                  receiver.display_name AS to_actor,
+                  m.endpoint,
+                  mse.status,
+                  mse.timestamp_us
+           FROM messages m
+           INNER JOIN message_status_events mse ON m.id = mse.message_id
+           LEFT JOIN actors sender ON m.from_actor_id = sender.id
+           LEFT JOIN actors receiver ON m.to_actor_id = receiver.id
+           LEFT JOIN meshes sm ON sender.mesh_id = sm.id
+           LEFT JOIN meshes rm ON receiver.mesh_id = rm.id
+           WHERE sm.given_name = 'sender' AND rm.given_name = 'compute'
+           ORDER BY m.id, mse.timestamp_us""",
     ),
 ]
 
@@ -381,12 +432,13 @@ def run_queries(engine, summary: bool = False) -> None:
         print()
 
 
-def run_workload(job, summary=False):
+def run_workload(job, summary=False, interactive=False):
     """Run the full telemetry demo: spawn actors, run work, query, and shut down.
 
     Args:
         job: JobTrait whose state has a "workers" HostMesh.
         summary: If True, print summary output instead of full tables.
+        interactive: If True, pause after setup so the dashboard can be browsed.
     """
     print("=" * 50)
     print()
@@ -428,6 +480,17 @@ def run_workload(job, summary=False):
     print("Waiting for trace events to flush...")
     time.sleep(1.0)
 
+    if interactive:
+        import signal
+
+        dashboard_url = os.environ.get("MONARCH_DASHBOARD_URL", "http://localhost:8265")
+        print(f"\nDashboard at {dashboard_url}")
+        print("Press Ctrl+C to continue to queries...")
+        try:
+            signal.pause()
+        except KeyboardInterrupt:
+            print()
+
     print()
     print("Querying real telemetry data...")
     print("-" * 50)
@@ -440,16 +503,22 @@ def run_workload(job, summary=False):
     hosts.shutdown().get()
 
 
-def main(summary: bool = False) -> None:
+def main(summary: bool = False, interactive: bool = False) -> None:
     run_workload(
         ProcessJob({"hosts": 2}),
-        summary,
+        summary=summary,
+        interactive=interactive,
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary", action="store_true")
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Pause after setup so the dashboard can be browsed",
+    )
     args = parser.parse_args()
 
-    main(summary=args.summary)
+    main(summary=args.summary, interactive=args.interactive)

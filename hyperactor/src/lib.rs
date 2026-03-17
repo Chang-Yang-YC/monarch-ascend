@@ -64,7 +64,6 @@ pub mod actor;
 pub mod actor_local;
 pub mod channel;
 pub mod checkpoint;
-pub mod clock;
 pub mod config;
 pub mod context;
 pub mod host;
@@ -76,10 +75,12 @@ pub mod message;
 pub mod metrics;
 pub mod ordering;
 pub mod panic_handler;
+pub mod port;
 pub mod proc;
+pub mod ref_;
 pub mod reference;
+pub mod remote;
 mod signal_handler;
-pub mod simnet;
 mod stdio_redirect;
 pub mod supervision;
 pub mod sync;
@@ -160,12 +161,10 @@ pub use proc::Instance;
 pub use proc::InstanceCell;
 pub use proc::Proc;
 pub use proc::WeakProc;
-pub use reference::ActorId;
+// Re-exported because `hyperactor_macros::RefClient` generates code referencing `hyperactor::ActorRef`.
+#[doc(hidden)]
 pub use reference::ActorRef;
-pub use reference::OncePortRef;
-pub use reference::PortId;
-pub use reference::PortRef;
-pub use reference::ProcId;
+pub use remote::Accepts;
 #[doc(inline)]
 pub use signal_handler::SignalCleanupGuard;
 #[doc(inline)]

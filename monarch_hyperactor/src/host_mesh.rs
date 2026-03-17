@@ -15,10 +15,9 @@ use std::time::Duration;
 use hyperactor::ActorHandle;
 use hyperactor::Instance;
 use hyperactor::Proc;
-use hyperactor::clock::Clock;
-use hyperactor::clock::RealClock;
 use hyperactor_mesh::ProcMeshRef;
 use hyperactor_mesh::bootstrap::BootstrapCommand;
+use hyperactor_mesh::bootstrap::ProcBind;
 use hyperactor_mesh::bootstrap::host;
 use hyperactor_mesh::host_mesh::HostMesh;
 use hyperactor_mesh::host_mesh::HostMeshRef;
@@ -165,18 +164,21 @@ impl PyHostMesh {
         })
     }
 
+    #[pyo3(signature = (instance, name, per_host, proc_bind = None))]
     fn spawn_nonblocking(
         &self,
         instance: &PyInstance,
         name: String,
         per_host: &PyExtent,
+        proc_bind: Option<Vec<HashMap<String, String>>>,
     ) -> PyResult<PyPythonTask> {
         let host_mesh = self.mesh_ref()?.clone();
         let instance = instance.clone();
         let per_host = per_host.clone().into();
+        let proc_bind = proc_bind.map(|v| v.into_iter().map(ProcBind::from).collect());
         let mesh_impl = async move {
             let proc_mesh = host_mesh
-                .spawn(instance.deref(), &name, per_host)
+                .spawn(instance.deref(), &name, per_host, proc_bind)
                 .await
                 .map_err(to_py_error)?;
             Ok(PyProcMesh::new_owned(proc_mesh))
@@ -312,7 +314,7 @@ fn bootstrap_host(bootstrap_cmd: Option<PyBootstrapCommand>) -> PyResult<PyPytho
     };
 
     PyPythonTask::new(async move {
-        let host_mesh_agent = host(
+        let (host_mesh_agent, _shutdown) = host(
             default_bind_spec().binding_addr(),
             Some(bootstrap_cmd),
             None,
@@ -327,6 +329,10 @@ fn bootstrap_host(bootstrap_cmd: Option<PyBootstrapCommand>) -> PyResult<PyPytho
         let host_mesh_name = hyperactor_mesh::Name::new_reserved("local").unwrap();
         let host_mesh = HostMeshRef::from_host_agent(host_mesh_name, host_mesh_agent.bind())
             .map_err(|e| PyException::new_err(e.to_string()))?;
+
+        // Register C so MeshAdminAgent can discover it ("A/C
+        // invariant" - hyperactor_mesh/src/mesh_admin.rs).
+        hyperactor_mesh::global_context::register_client_host(host_mesh.clone());
 
         // We require a temporary instance to make a call to the host/proc agent.
         let temp_proc = Proc::local();
@@ -362,7 +368,7 @@ fn bootstrap_host(bootstrap_cmd: Option<PyBootstrapCommand>) -> PyResult<PyPytho
 
         // Notify telemetry of the bootstrap host mesh, proc mesh, and client actor.
         {
-            let now = RealClock.system_time_now();
+            let now = std::time::SystemTime::now();
 
             let host_name_str = host_mesh.name().to_string();
             let host_mesh_id = hyperactor_telemetry::hash_to_u64(&host_name_str);

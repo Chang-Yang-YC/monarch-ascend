@@ -14,16 +14,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperactor::ActorHandle;
 use hyperactor::ActorRef;
 use hyperactor::context;
+use hyperactor::reference;
 use serde::Deserialize;
 use serde::Serialize;
 use typeuri::Named;
 
-use crate::RdmaLocalMemory;
 use crate::RdmaManagerActor;
 use crate::ReleaseBufferClient;
-use crate::backend::RdmaBackendContext;
+use crate::backend::RdmaRemoteBackendContext;
 
 #[cfg(not(feature = "hixl"))]
 use crate::RdmaOp;
@@ -38,6 +39,9 @@ use crate::backend::ibverbs::IbvBuffer;
 use crate::backend::ibverbs::manager_actor::IbvManagerActor;
 #[cfg(not(feature = "hixl"))]
 use crate::backend::ibverbs::manager_actor::IbvManagerMessageClient;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::tcp::manager_actor::TcpManagerActor;
+use crate::local_memory::RdmaLocalMemory;
 
 #[cfg(feature = "hixl")]
 use crate::backend::hixl::HixlBuffer;
@@ -47,16 +51,74 @@ use crate::backend::hixl::HixlBuffer;
 pub struct RdmaRemoteBuffer {
     pub id: usize,
     pub size: usize,
-    pub owner: ActorRef<RdmaManagerActor>,
-    pub backends: Vec<RdmaBackendContext>,
+    pub owner: reference::ActorRef<RdmaManagerActor>,
+    pub backends: Vec<RdmaRemoteBackendContext>,
 }
 wirevalue::register_type!(RdmaRemoteBuffer);
 
+/// Backend handle returned by [`RdmaRemoteBuffer::choose_backend`].
+///
+/// `RdmaBackend` is not object-safe (associated type + generic parameter
+/// on `submit`), so we use an enum that delegates to the concrete handle.
+#[cfg(not(feature = "hixl"))]
+#[derive(Debug)]
+pub enum RdmaLocalBackend {
+    Ibv(ActorHandle<IbvManagerActor>),
+    Tcp(ActorHandle<TcpManagerActor>),
+}
+
+#[cfg(not(feature = "hixl"))]
+impl RdmaLocalBackend {
+    async fn submit(
+        &mut self,
+        cx: &(impl context::Actor + Send + Sync),
+        ops: Vec<RdmaOp>,
+        timeout: Duration,
+    ) -> Result<(), anyhow::Error> {
+        match self {
+            RdmaLocalBackend::Ibv(h) => h.submit(cx, ops, timeout).await,
+            RdmaLocalBackend::Tcp(h) => h.submit(cx, ops, timeout).await,
+        }
+    }
+}
+
 impl RdmaRemoteBuffer {
     // ----------------------------------------------------------------
-    // GPU: ibverbs path
+    // GPU: ibverbs/tcp path
     // ----------------------------------------------------------------
 
+    /// Choose the best available backend for this buffer.
+    ///
+    /// Prefers ibverbs when both the local and remote sides support it.
+    /// Falls back to TCP when ibverbs is unavailable and
+    /// [`RDMA_ALLOW_TCP_FALLBACK`](crate::config::RDMA_ALLOW_TCP_FALLBACK)
+    /// is enabled.
+    #[cfg(not(feature = "hixl"))]
+    pub async fn choose_backend(
+        &self,
+        client: &(impl context::Actor + Send + Sync),
+    ) -> Result<RdmaLocalBackend, anyhow::Error> {
+        if self.has_ibverbs_backend() {
+            if let Ok(ibv_backend) = IbvManagerActor::local_handle(client).await {
+                return Ok(RdmaLocalBackend::Ibv(ibv_backend));
+            }
+
+            return self
+                .tcp_fallback_or_bail("no ibverbs backend on the local side", client)
+                .await;
+        }
+
+        self.tcp_fallback_or_bail(
+            &format!(
+                "no ibverbs backend on the remote side (owner={})",
+                self.owner.actor_id()
+            ),
+            client,
+        )
+        .await
+    }
+
+    /// Push data from local memory into this remote buffer (local->remote).
     #[cfg(not(feature = "hixl"))]
     pub async fn write_from_local(
         &self,
@@ -64,8 +126,8 @@ impl RdmaRemoteBuffer {
         local: Arc<dyn RdmaLocalMemory>,
         timeout: u64,
     ) -> Result<bool, anyhow::Error> {
-        let mut local_ibv_backend = IbvManagerActor::local_handle(client).await?;
-        local_ibv_backend
+        let mut backend = self.choose_backend(client).await?;
+        backend
             .submit(
                 client,
                 vec![RdmaOp {
@@ -79,6 +141,7 @@ impl RdmaRemoteBuffer {
         Ok(true)
     }
 
+    /// Pull data from this remote buffer into local memory (remote->local).
     #[cfg(not(feature = "hixl"))]
     pub async fn read_into_local(
         &self,
@@ -86,8 +149,8 @@ impl RdmaRemoteBuffer {
         local: Arc<dyn RdmaLocalMemory>,
         timeout: u64,
     ) -> Result<bool, anyhow::Error> {
-        let mut local_ibv_backend = IbvManagerActor::local_handle(client).await?;
-        local_ibv_backend
+        let mut backend = self.choose_backend(client).await?;
+        backend
             .submit(
                 client,
                 vec![RdmaOp {
@@ -101,8 +164,28 @@ impl RdmaRemoteBuffer {
         Ok(true)
     }
 
+    /// Get a TCP backend handle, or bail if TCP fallback is disabled.
+    #[cfg(not(feature = "hixl"))]
+    async fn tcp_fallback_or_bail(
+        &self,
+        reason: &str,
+        client: &(impl context::Actor + Send + Sync),
+    ) -> Result<RdmaLocalBackend, anyhow::Error> {
+        if !hyperactor_config::global::get(crate::config::RDMA_ALLOW_TCP_FALLBACK) {
+            anyhow::bail!(
+                "{reason}, and TCP fallback is disabled; \
+                 enable it with monarch.configure(rdma_allow_tcp_fallback=True)"
+            );
+        }
+
+        tracing::warn!("falling back to TCP transport ({reason})");
+
+        let tcp_backend = TcpManagerActor::local_handle(client).await?;
+        Ok(RdmaLocalBackend::Tcp(tcp_backend))
+    }
+
     // ----------------------------------------------------------------
-    // NPU: HIXL path (Plan B — transfers via hixl-sys)
+    // NPU: HIXL path (transfers via hixl-sys)
     // ----------------------------------------------------------------
 
     #[cfg(feature = "hixl")]
@@ -213,22 +296,31 @@ impl RdmaRemoteBuffer {
         Ok(())
     }
 
-    /// Resolve ibverbs-specific buffer info (GPU path only).
+    /// Whether this buffer has an ibverbs backend context.
+    #[cfg(not(feature = "hixl"))]
+    fn has_ibverbs_backend(&self) -> bool {
+        self.backends
+            .iter()
+            .any(|b| matches!(b, RdmaRemoteBackendContext::Ibverbs(..)))
+    }
+
+    /// Resolve the ibverbs backend context for this buffer.
+    ///
+    /// Returns `None` if the buffer has no ibverbs backend context (i.e.,
+    /// the remote side was created without ibverbs). Returns `Some(Err(...))`
+    /// if the context exists but lazy MR resolution fails. Returns
+    /// `Some(Ok(...))` on success.
     #[cfg(not(feature = "hixl"))]
     pub async fn resolve_ibv(
         &self,
         client: &impl context::Actor,
-    ) -> Result<(ActorRef<IbvManagerActor>, IbvBuffer), anyhow::Error> {
-        let RdmaBackendContext::Ibverbs(remote_ibv_mgr, remote_ibv_buf) =
-            self.backends.iter().map(Ok).next().unwrap_or_else(|| {
-                Err(anyhow::anyhow!(
-                    "ibverbs backend not found for buffer: {:?}",
-                    self
-                ))
-            })?;
+    ) -> Option<Result<(reference::ActorRef<IbvManagerActor>, IbvBuffer), anyhow::Error>> {
+        let (remote_ibv_mgr, remote_ibv_buf) = self.backends.iter().find_map(|b| match b {
+            RdmaRemoteBackendContext::Ibverbs(mgr, buf) => Some((mgr, buf)),
+            _ => None,
+        })?;
 
-        Ok((
-            remote_ibv_mgr.clone(),
+        Some(
             remote_ibv_buf
                 .get_or_try_init(async {
                     remote_ibv_mgr
@@ -237,8 +329,24 @@ impl RdmaRemoteBuffer {
                         .ok_or_else(|| anyhow::anyhow!("buffer {} not found", self.id))
                 })
                 .await
-                .cloned()?,
-        ))
+                .cloned()
+                .map(|buf| (remote_ibv_mgr.clone(), buf)),
+        )
+    }
+
+    /// Extract the TCP backend context from this buffer.
+    ///
+    /// Unlike [`resolve_ibv`], no lazy initialization is needed -- the
+    /// TCP backend only needs the remote actor ref and the buffer id.
+    #[cfg(not(feature = "hixl"))]
+    pub fn resolve_tcp(&self) -> Result<(ActorRef<TcpManagerActor>, usize), anyhow::Error> {
+        self.backends
+            .iter()
+            .find_map(|b| match b {
+                RdmaRemoteBackendContext::Tcp(tcp_ref) => Some((tcp_ref.clone(), self.id)),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("tcp backend not found for buffer: {:?}", self))
     }
 
     /// Extract the [`HixlBuffer`] from the backend context (NPU path).
@@ -247,7 +355,7 @@ impl RdmaRemoteBuffer {
         self.backends
             .first()
             .map(|ctx| {
-                let RdmaBackendContext::Hixl(buf) = ctx;
+                let RdmaRemoteBackendContext::Hixl(buf) = ctx;
                 buf.clone()
             })
             .ok_or_else(|| {

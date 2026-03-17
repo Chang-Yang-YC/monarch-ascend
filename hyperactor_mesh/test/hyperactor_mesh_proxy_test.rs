@@ -18,17 +18,17 @@ use hyperactor::Actor;
 use hyperactor::Context;
 use hyperactor::Handler;
 use hyperactor::Instance;
-use hyperactor::PortRef;
 use hyperactor::RemoteSpawn;
 use hyperactor::channel::ChannelTransport;
 use hyperactor::context::Mailbox;
+use hyperactor::reference;
 use hyperactor_config::Flattrs;
 use hyperactor_mesh::ActorMesh;
 use hyperactor_mesh::ProcMesh;
 use hyperactor_mesh::alloc::AllocSpec;
 use hyperactor_mesh::alloc::Allocator;
 use hyperactor_mesh::alloc::ProcessAllocator;
-use hyperactor_mesh::global_root_client;
+use hyperactor_mesh::context;
 use hyperactor_mesh::supervision::MeshFailure;
 use ndslice::View;
 use ndslice::extent;
@@ -79,7 +79,7 @@ impl RemoteSpawn for TestActor {
 }
 
 #[derive(Debug, Serialize, Deserialize, Named, Clone)]
-pub struct Echo(pub String, pub PortRef<String>);
+pub struct Echo(pub String, pub reference::PortRef<String>);
 
 #[async_trait]
 impl Handler<Echo> for TestActor {
@@ -115,7 +115,8 @@ impl fmt::Debug for ProxyActor {
 #[async_trait]
 impl Actor for ProxyActor {
     async fn init(&mut self, _this: &Instance<Self>) -> Result<(), anyhow::Error> {
-        let instance = global_root_client();
+        let cx = context().await;
+        let instance = cx.actor_instance;
         self.actor_mesh = Some(self.proc_mesh.spawn(instance, "echo", &()).await.unwrap());
         Ok(())
     }
@@ -144,7 +145,8 @@ impl RemoteSpawn for ProxyActor {
             })
             .await
             .unwrap();
-        let instance = global_root_client();
+        let cx = context().await;
+        let instance = cx.actor_instance;
         let proc_mesh = Arc::new(
             ProcMesh::allocate(instance, Box::new(alloc), "proxy")
                 .await
@@ -198,7 +200,8 @@ async fn run_client(exe_path: PathBuf, keep_alive: bool) -> Result<(), anyhow::E
         .await
         .unwrap();
 
-    let instance = global_root_client();
+    let cx = context().await;
+    let instance = cx.actor_instance;
 
     let mut proc_mesh = ProcMesh::allocate(instance, Box::new(alloc), "client").await?;
     let actor_mesh: ActorMesh<ProxyActor> = proc_mesh
@@ -221,7 +224,6 @@ async fn run_client(exe_path: PathBuf, keep_alive: bool) -> Result<(), anyhow::E
         // $USER | grep proxy_test | head -1 | awk '{print "kill -TERM
         // -" $2}'` to interactively test termination.
         loop {
-            #[allow(clippy::disallowed_methods)]
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }

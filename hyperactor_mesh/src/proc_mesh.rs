@@ -20,10 +20,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use hyperactor::Actor;
-use hyperactor::ActorId;
-use hyperactor::ActorRef;
 use hyperactor::Handler;
-use hyperactor::ProcId;
 use hyperactor::RemoteMessage;
 use hyperactor::RemoteSpawn;
 use hyperactor::accum::StreamingReducerOpts;
@@ -32,11 +29,10 @@ use hyperactor::actor::Referable;
 use hyperactor::actor::remote::Remote;
 use hyperactor::channel;
 use hyperactor::channel::ChannelAddr;
-use hyperactor::clock::Clock;
-use hyperactor::clock::RealClock;
 use hyperactor::context;
 use hyperactor::mailbox::DialMailboxRouter;
 use hyperactor::mailbox::MailboxServer;
+use hyperactor::reference as hyperactor_reference;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
@@ -106,16 +102,20 @@ pub const COMM_ACTOR_NAME: &str = "comm";
 /// A reference to a single [`hyperactor::Proc`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcRef {
-    proc_id: ProcId,
+    proc_id: hyperactor_reference::ProcId,
     /// The rank of this proc at creation.
     create_rank: usize,
     /// The agent managing this proc.
-    agent: ActorRef<ProcAgent>,
+    agent: hyperactor_reference::ActorRef<ProcAgent>,
 }
 
 impl ProcRef {
     /// Create a new proc ref from the provided id, create rank and agent.
-    pub fn new(proc_id: ProcId, create_rank: usize, agent: ActorRef<ProcAgent>) -> Self {
+    pub fn new(
+        proc_id: hyperactor_reference::ProcId,
+        create_rank: usize,
+        agent: hyperactor_reference::ActorRef<ProcAgent>,
+    ) -> Self {
         Self {
             proc_id,
             create_rank,
@@ -142,18 +142,18 @@ impl ProcRef {
         }
     }
 
-    pub fn proc_id(&self) -> &ProcId {
+    pub fn proc_id(&self) -> &hyperactor_reference::ProcId {
         &self.proc_id
     }
 
-    pub(crate) fn actor_id(&self, name: &Name) -> ActorId {
+    pub(crate) fn actor_id(&self, name: &Name) -> hyperactor_reference::ActorId {
         self.proc_id.actor_id(name.to_string(), 0)
     }
 
     /// Generic bound: `A: Referable` - required because we return
     /// an `ActorRef<A>`.
-    pub(crate) fn attest<A: Referable>(&self, name: &Name) -> ActorRef<A> {
-        ActorRef::attest(self.actor_id(name))
+    pub(crate) fn attest<A: Referable>(&self, name: &Name) -> hyperactor_reference::ActorRef<A> {
+        hyperactor_reference::ActorRef::attest(self.actor_id(name))
     }
 }
 
@@ -191,13 +191,13 @@ impl ProcMesh {
         // supervision event handler. Last-mesh-wins semantics: if a
         // previous mesh installed a sink, it is replaced.
         if let Some(first) = ranks.first() {
-            crate::global_client::set_global_supervision_sink(
+            crate::global_context::set_global_supervision_sink(
                 first.agent.port::<ActorSupervisionEvent>(),
             );
         }
 
         let root_comm_actor = comm_actor_name.as_ref().map(|name| {
-            ActorRef::attest(
+            hyperactor_reference::ActorRef::attest(
                 ranks
                     .first()
                     .expect("root mesh cannot be empty")
@@ -230,7 +230,7 @@ impl ProcMesh {
 
             hyperactor_telemetry::notify_mesh_created(hyperactor_telemetry::MeshEvent {
                 id: mesh_id_hash,
-                timestamp: RealClock.system_time_now(),
+                timestamp: std::time::SystemTime::now(),
                 class: "Proc".to_string(),
                 given_name: name.name().to_string(),
                 full_name: name_str,
@@ -241,7 +241,7 @@ impl ProcMesh {
 
             // Notify telemetry of each ProcAgent actor in this mesh.
             // These are skipped in Proc::spawn_inner. mesh_id directly points to proc mesh.
-            let now = RealClock.system_time_now();
+            let now = std::time::SystemTime::now();
             for rank in current_ref.ranks.iter() {
                 let actor_id = rank.agent.actor_id();
 
@@ -569,7 +569,10 @@ impl ProcMesh {
                 Ok(())
             }
             ProcMeshAllocation::Owned { hosts, .. } => {
-                let procs = self.current_ref.proc_ids().collect::<Vec<ProcId>>();
+                let procs = self
+                    .current_ref
+                    .proc_ids()
+                    .collect::<Vec<hyperactor_reference::ProcId>>();
                 // We use the proc mesh region rather than the host mesh region
                 // because the host agent stores one entry per proc, not per host.
                 hosts
@@ -705,7 +708,7 @@ pub struct ProcMeshRef {
     // should be removed after we remove the v0 code.
     // v0 casting requires root mesh rank 0 as the 1st hop, so we need to provide
     // it here. For v1, this can be removed since v1 can use any rank.
-    pub(crate) root_comm_actor: Option<ActorRef<CommActor>>,
+    pub(crate) root_comm_actor: Option<hyperactor_reference::ActorRef<CommActor>>,
 }
 wirevalue::register_type!(ProcMeshRef);
 
@@ -718,7 +721,7 @@ impl ProcMeshRef {
         ranks: Arc<Vec<ProcRef>>,
         host_mesh: Option<HostMeshRef>,
         root_region: Option<Region>,
-        root_comm_actor: Option<ActorRef<CommActor>>,
+        root_comm_actor: Option<hyperactor_reference::ActorRef<CommActor>>,
     ) -> crate::Result<Self> {
         if region.num_ranks() != ranks.len() {
             return Err(crate::Error::InvalidRankCardinality {
@@ -750,7 +753,7 @@ impl ProcMeshRef {
         }
     }
 
-    pub(crate) fn root_comm_actor(&self) -> Option<&ActorRef<CommActor>> {
+    pub(crate) fn root_comm_actor(&self) -> Option<&hyperactor_reference::ActorRef<CommActor>> {
         self.root_comm_actor.as_ref()
     }
 
@@ -833,7 +836,7 @@ impl ProcMeshRef {
             // the agent will be unresponsive.
             // We handle this by setting a timeout on the recv, and if we don't get a
             // message we assume the agent is dead and return a failed state.
-            let state = RealClock.timeout(timeout, rx.recv()).await;
+            let state = tokio::time::timeout(timeout, rx.recv()).await;
             if let Ok(state) = state {
                 // Handle non-timeout receiver error.
                 let state = state?;
@@ -905,7 +908,9 @@ impl ProcMeshRef {
         &self,
         cx: &impl context::Actor,
     ) -> crate::Result<Option<ValueMesh<resource::State<ProcState>>>> {
-        let names = self.proc_ids().collect::<Vec<ProcId>>();
+        let names = self
+            .proc_ids()
+            .collect::<Vec<hyperactor_reference::ProcId>>();
         if let Some(host_mesh) = &self.host_mesh {
             Ok(Some(
                 host_mesh
@@ -918,7 +923,7 @@ impl ProcMeshRef {
     }
 
     /// Returns an iterator over the proc ids in this mesh.
-    pub(crate) fn proc_ids(&self) -> impl Iterator<Item = ProcId> {
+    pub(crate) fn proc_ids(&self) -> impl Iterator<Item = hyperactor_reference::ProcId> {
         self.ranks.iter().map(|proc_ref| proc_ref.proc_id.clone())
     }
 
@@ -1094,7 +1099,7 @@ impl ProcMeshRef {
             },
         )?;
 
-        let start_time = RealClock.now();
+        let start_time = tokio::time::Instant::now();
 
         // Wait for all ranks to report a terminal or running status.
         // If any proc reports a failure (via supervision) or the mesh
@@ -1152,8 +1157,17 @@ impl ProcMeshRef {
                 Some(cx.instance().port().bind()),
                 statuses,
             );
+            // AI-3: controller name must include mesh identity for
+            // proc-wide ActorId uniqueness. A fixed base name alone
+            // collides across parents because pid allocation is
+            // parent-scoped.
+            let controller_name = format!(
+                "{}_{}",
+                crate::mesh_controller::ACTOR_MESH_CONTROLLER_NAME,
+                mesh.name()
+            );
             let controller = controller
-                .spawn(cx)
+                .spawn_with_name(cx, &controller_name)
                 .map_err(|e| Error::ControllerActorSpawnError(mesh.name().clone(), e))?;
             // Controller and ActorMesh both depend on references from each other, break
             // the cycle by setting the controller after the fact.
@@ -1172,8 +1186,11 @@ impl ProcMeshRef {
 
             hyperactor_telemetry::notify_mesh_created(hyperactor_telemetry::MeshEvent {
                 id: mesh_id_hash,
-                timestamp: RealClock.system_time_now(),
-                class: actor_type,
+                timestamp: std::time::SystemTime::now(),
+                class: supervision_display_name
+                    .as_deref()
+                    .and_then(python_class_from_supervision_name)
+                    .unwrap_or(actor_type),
                 given_name: mesh.name().name().to_string(),
                 full_name: name_str,
                 shape_json: serde_json::to_string(&self.region().extent()).unwrap_or_default(),
@@ -1184,7 +1201,7 @@ impl ProcMeshRef {
             // Notify telemetry of each actor in this mesh. The rank is
             // the actor's position within the actor mesh (not the proc's
             // create_rank, which reflects the original unsliced mesh).
-            let now = RealClock.system_time_now();
+            let now = std::time::SystemTime::now();
             for (rank, proc_ref) in self.ranks.iter().enumerate() {
                 let display_name = supervision_display_name.as_ref().map(|sdn| {
                     let point = self.region().extent().point_of_rank(rank).unwrap();
@@ -1274,7 +1291,7 @@ impl ProcMeshRef {
                 reply: port.bind(),
             },
         )?;
-        let start_time = RealClock.now();
+        let start_time = tokio::time::Instant::now();
 
         // Reuse actor spawn idle time.
         let max_idle_time = hyperactor_config::global::get(ACTOR_SPAWN_MAX_IDLE);
@@ -1357,6 +1374,17 @@ impl view::RankedSliceable for ProcMeshRef {
     }
 }
 
+/// Extract a Python class display name from a supervision display name.
+///
+/// The supervision display name format is `{instance}.<{module}.{ClassName} {mesh_name}>`.
+/// Returns `"Python<ClassName>"` if the format matches, `None` otherwise.
+fn python_class_from_supervision_name(sdn: &str) -> Option<String> {
+    let inner = sdn.rsplit_once('<')?.1.strip_suffix('>')?;
+    let qualified = inner.split_whitespace().next()?;
+    let class_name = qualified.rsplit_once('.')?.1;
+    Some(format!("Python<{class_name}>"))
+}
+
 #[cfg(test)]
 mod tests {
     use hyperactor::Instance;
@@ -1393,13 +1421,13 @@ mod tests {
     #[async_timed_test(timeout_secs = 30)]
     #[cfg(fbcode_build)]
     async fn test_spawn_actor() {
-        hyperactor_telemetry::initialize_logging(hyperactor::clock::ClockKind::default());
+        hyperactor_telemetry::initialize_logging(hyperactor_telemetry::DefaultTelemetryClock {});
 
         let instance = testing::instance();
 
         let mut hm = testing::host_mesh(4).await;
         let proc_mesh = hm
-            .spawn(&instance, "test", extent!(gpus = 2))
+            .spawn(&instance, "test", extent!(gpus = 2), None)
             .await
             .unwrap();
         let actor_mesh = proc_mesh.spawn(instance, "test", &()).await.unwrap();
@@ -1411,13 +1439,13 @@ mod tests {
     #[tokio::test]
     #[cfg(fbcode_build)]
     async fn test_failing_spawn_actor() {
-        hyperactor_telemetry::initialize_logging(hyperactor::clock::ClockKind::default());
+        hyperactor_telemetry::initialize_logging(hyperactor_telemetry::DefaultTelemetryClock {});
 
         let instance = testing::instance();
 
         let mut hm = testing::host_mesh(4).await;
         let proc_mesh = hm
-            .spawn(&instance, "test", extent!(gpus = 2))
+            .spawn(&instance, "test", extent!(gpus = 2), None)
             .await
             .unwrap();
         let err = proc_mesh
@@ -1435,5 +1463,28 @@ mod tests {
         );
 
         let _ = hm.shutdown(instance).await;
+    }
+
+    #[test]
+    fn test_python_class_from_supervision_name() {
+        use super::python_class_from_supervision_name;
+
+        assert_eq!(
+            python_class_from_supervision_name("instance0.<my_module.MyWorker test_mesh>"),
+            Some("Python<MyWorker>".to_string()),
+        );
+        assert_eq!(
+            python_class_from_supervision_name(
+                "instance0.<package.submodule.TrainingActor mesh_0>"
+            ),
+            Some("Python<TrainingActor>".to_string()),
+        );
+        // No angle brackets — not a Python supervision name.
+        assert_eq!(python_class_from_supervision_name("plain_name"), None,);
+        // Malformed: missing dot-qualified class name.
+        assert_eq!(
+            python_class_from_supervision_name("instance0.<NoModule mesh>"),
+            None,
+        );
     }
 }

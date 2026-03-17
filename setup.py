@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 from setuptools import Command, setup
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 from setuptools.extension import Extension
 from setuptools_rust import Binding, RustExtension
 
@@ -95,7 +96,7 @@ def get_cuda_home() -> Optional[str]:
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
-    # Check common locations
+    # Check common CUDA locations
     for path in ["/usr/local/cuda", "/usr/cuda"]:
         if os.path.exists(path):
             return path
@@ -117,22 +118,18 @@ def get_ascend_home() -> Optional[str]:
     arch = platform.machine()  # e.g. aarch64, x86_64
     arch_suffix = f"{arch}-linux"
 
-    # 1. Explicit environment variable
     ascend_home = os.environ.get("ASCEND_HOME")
     if ascend_home and os.path.isdir(os.path.join(ascend_home, "include")):
         return ascend_home
 
-    # 2. Walk the default toolkit location
     toolkit_base = "/usr/local/Ascend/ascend-toolkit"
     if os.path.isdir(toolkit_base):
-        # Prefer the "latest" symlink
         latest = os.path.join(toolkit_base, "latest")
         if os.path.exists(latest):
             candidate = os.path.join(os.path.realpath(latest), arch_suffix)
             if os.path.isdir(os.path.join(candidate, "include")):
                 return candidate
 
-        # Fall back to highest version
         versions = sorted(
             [
                 d
@@ -146,7 +143,6 @@ def get_ascend_home() -> Optional[str]:
             if os.path.isdir(os.path.join(candidate, "include")):
                 return candidate
 
-    # 3. Try npu-smi in PATH
     try:
         result = subprocess.run(
             ["which", "npu-smi"], capture_output=True, text=True, timeout=5
@@ -160,10 +156,28 @@ def get_ascend_home() -> Optional[str]:
     return None
 
 
+def get_rocm_home() -> Optional[str]:
+    """
+    Find ROCm installation.
+
+    Returns:
+        Path to ROCm installation or None if not found
+    """
+    rocm_home = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME")
+    if rocm_home and os.path.exists(rocm_home):
+        return rocm_home
+
+    if os.path.exists("/opt/rocm"):
+        return "/opt/rocm"
+
+    return None
+
+
 # Build config detection
 torch_config = get_torch_config()
 cuda_home = get_cuda_home()
 ascend_home = get_ascend_home()
+rocm_home = get_rocm_home()
 use_tensor_engine = os.environ.get("USE_TENSOR_ENGINE", "1") == "1"
 use_ascend_engine = os.environ.get("USE_ASCEND_ENGINE", "0") == "1"
 
@@ -186,8 +200,25 @@ if use_tensor_engine and not torch_config:
     sys.exit(1)
 
 build_tensor_engine = use_tensor_engine and torch_config is not None
-build_cuda = build_tensor_engine and cuda_home is not None
 build_ascend = use_ascend_engine and ascend_home is not None
+
+# GPU platform selection: use MONARCH_RDMA_GPU_PLATFORM env var or auto-detect
+gpu_platform = os.environ.get("MONARCH_RDMA_GPU_PLATFORM", "").lower()
+if gpu_platform and gpu_platform not in ("cuda", "rocm"):
+    sys.exit(f"Invalid MONARCH_RDMA_GPU_PLATFORM={gpu_platform}. Use 'cuda' or 'rocm'")
+if gpu_platform == "rocm" and not rocm_home:
+    sys.exit("MONARCH_RDMA_GPU_PLATFORM=rocm but ROCm not found")
+if gpu_platform == "cuda" and not cuda_home:
+    sys.exit("MONARCH_RDMA_GPU_PLATFORM=cuda but CUDA not found")
+if not gpu_platform and build_tensor_engine and cuda_home and rocm_home:
+    sys.exit("Both CUDA and ROCm detected. Set MONARCH_RDMA_GPU_PLATFORM=cuda or =rocm")
+
+build_cuda = build_tensor_engine and (
+    gpu_platform == "cuda" or (not gpu_platform and cuda_home)
+)
+build_rocm = build_tensor_engine and (
+    gpu_platform == "rocm" or (not gpu_platform and rocm_home)
+)
 
 print("=" * 80)
 if build_ascend:
@@ -195,18 +226,19 @@ if build_ascend:
     print(f"  - Ascend CANN: {ascend_home}")
     if torch_config:
         print(f"  - PyTorch: {torch_config['lib_path']}")
-        print(
-            f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}"
-        )
+        print(f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}")
 elif build_tensor_engine:
-    print("Building WITH tensor_engine (CUDA/GPU support)")
+    print("Building WITH tensor_engine (GPU support)")
     print(f"  - PyTorch: {torch_config['lib_path']}")
-    print(f"  - CUDA: {cuda_home if build_cuda else 'Not found (CPU-only)'}")
-    print(
-        f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}"
-    )
+    if build_cuda:
+        print(f"  - CUDA: {cuda_home}")
+    elif build_rocm:
+        print(f"  - ROCm: {rocm_home}")
+    else:
+        print("  - GPU: Not found (CPU-only)")
+    print(f"  - C++11 ABI: {'enabled' if torch_config['cxx11_abi'] else 'disabled'}")
 else:
-    print("Building WITHOUT tensor_engine (CPU-only, no CUDA/NPU support)")
+    print("Building WITHOUT tensor_engine (CPU-only, no GPU/NPU support)")
 print("=" * 80)
 
 # Set PYO3_PYTHON for Rust binaries
@@ -239,6 +271,8 @@ else:
 
 if build_cuda:
     env_vars["CUDA_HOME"] = cuda_home
+elif build_rocm:
+    env_vars["ROCM_PATH"] = rocm_home
 
 if build_ascend:
     env_vars["ASCEND_HOME"] = ascend_home
@@ -322,6 +356,7 @@ ext_modules = []
 if build_tensor_engine:
     cpp_sources = ["python/monarch/common/init.cpp"]
     if build_cuda:
+        # mock_cuda.cpp is not compatible with ROCm (relies on CUDA-specific assembly)
         cpp_sources.append("python/monarch/common/mock_cuda.cpp")
 
     ext_modules = [
@@ -368,6 +403,56 @@ rust_extensions.append(
 )
 
 
+# BuildFrontend command
+class BuildFrontend(Command):
+    """Build the React frontend for monarch_dashboard"""
+
+    user_options = []
+
+    def initialize_options(self):
+        pass
+
+    def finalize_options(self):
+        pass
+
+    def run(self):
+        frontend_dir = os.path.join(
+            os.path.dirname(__file__),
+            "python",
+            "monarch",
+            "monarch_dashboard",
+            "frontend",
+        )
+        build_dir = os.path.join(frontend_dir, "build")
+        build_index = os.path.join(build_dir, "index.html")
+
+        # Skip npm if pre-built assets already exist (e.g. from CI).
+        if os.path.isfile(build_index):
+            print(">> Pre-built frontend found, skipping npm build")
+            return
+
+        if not os.path.exists(frontend_dir):
+            print(f"Frontend directory not found: {frontend_dir}")
+            return
+
+        # Use real npm, bypassing any system wrappers
+        npm_cmd = "/usr/bin/npm" if os.path.exists("/usr/bin/npm") else "npm"
+
+        print("Building dashboard frontend...")
+        try:
+            subprocess.check_call([npm_cmd, "install"], cwd=frontend_dir)
+            subprocess.check_call([npm_cmd, "run", "build"], cwd=frontend_dir)
+            print("Frontend build completed successfully")
+        except FileNotFoundError:
+            print("WARNING: npm not found. Skipping frontend build.")
+            print(
+                "Install Node.js to build the dashboard frontend, "
+                "or use pre-built assets."
+            )
+        except subprocess.CalledProcessError as e:
+            print("Frontend build failed with error:", e)
+
+
 # Clean command
 class Clean(Command):
     user_options = []
@@ -401,6 +486,14 @@ class Clean(Command):
         subprocess.run(["cargo", "clean"])
 
 
+class BuildPyWithFrontend(build_py):
+    """Build the frontend before collecting package data."""
+
+    def run(self):
+        self.run_command("build_frontend")
+        build_py.run(self)
+
+
 # Actual Setup
 package_name = os.environ.get("MONARCH_PACKAGE_NAME", "torchmonarch")
 package_version = os.environ.get("MONARCH_VERSION", "0.4.0.dev0")
@@ -411,7 +504,9 @@ setup(
     ext_modules=ext_modules,
     rust_extensions=rust_extensions,
     cmdclass={
+        "build_py": BuildPyWithFrontend,
         "build_ext": build_ext,
         "clean": Clean,
+        "build_frontend": BuildFrontend,
     },
 )

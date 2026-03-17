@@ -9,10 +9,9 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use hyperactor::ActorId;
-use hyperactor::ProcId;
-use hyperactor::introspect::NodePayload;
-use hyperactor::introspect::NodeProperties;
+use hyperactor::reference as hyperactor_reference;
+use hyperactor_mesh::introspect::NodePayload;
+use hyperactor_mesh::introspect::NodeProperties;
 use serde_json::Value;
 
 /// Derive a human-friendly label for a resolved node payload.
@@ -31,25 +30,9 @@ pub(crate) fn derive_label(payload: &NodePayload) -> String {
     match &payload.properties {
         NodeProperties::Root { num_hosts, .. } => format!("Mesh Root ({} hosts)", num_hosts),
         NodeProperties::Host {
-            addr,
-            num_procs,
-            system_children,
-            ..
+            addr, num_procs, ..
         } => {
-            let num_system = system_children.len();
-            let num_user = num_procs.saturating_sub(num_system);
-            let mut parts = Vec::new();
-            if num_user > 0 {
-                parts.push(format!("{} user", num_user));
-            }
-            if num_system > 0 {
-                parts.push(format!("{} system", num_system));
-            }
-            if parts.is_empty() {
-                format!("{}  ({} procs)", addr, num_procs)
-            } else {
-                format!("{}  ({} procs: {})", addr, num_procs, parts.join(", "))
-            }
+            format!("{}  ({} procs)", addr, num_procs)
         }
         NodeProperties::Proc {
             proc_name,
@@ -61,19 +44,19 @@ pub(crate) fn derive_label(payload: &NodePayload) -> String {
             failed_actor_count,
             ..
         } => {
-            let short = ProcId::from_str(proc_name)
+            let short = hyperactor_reference::ProcId::from_str(proc_name)
                 .map(|pid| pid.name().to_string())
                 .unwrap_or_else(|_| proc_name.clone());
             let num_system = system_children.len();
             let num_stopped = stopped_children.len();
-            let num_live = num_actors.saturating_sub(num_system);
+            let num_user = num_actors.saturating_sub(num_system);
             let total = num_actors + num_stopped;
             let mut parts = Vec::new();
             if num_system > 0 {
                 parts.push(format!("{} system", num_system));
             }
-            if num_live > 0 {
-                parts.push(format!("{} live", num_live));
+            if num_user > 0 {
+                parts.push(format!("{} user", num_user));
             }
             if num_stopped > 0 {
                 if num_stopped >= *stopped_retention_cap && *stopped_retention_cap > 0 {
@@ -93,10 +76,12 @@ pub(crate) fn derive_label(payload: &NodePayload) -> String {
                 base
             }
         }
-        NodeProperties::Actor { .. } => match ActorId::from_str(&payload.identity) {
-            Ok(actor_id) => format!("{}[{}]", actor_id.name(), actor_id.pid()),
-            Err(_) => payload.identity.clone(),
-        },
+        NodeProperties::Actor { .. } => {
+            match hyperactor_reference::ActorId::from_str(&payload.identity) {
+                Ok(actor_id) => format!("{}[{}]", actor_id.name(), actor_id.pid()),
+                Err(_) => payload.identity.clone(),
+            }
+        }
         NodeProperties::Error { code, message } => {
             format!("[error] {}: {}", code, message)
         }
@@ -109,7 +94,7 @@ pub(crate) fn derive_label(payload: &NodePayload) -> String {
 /// If the reference parses as an `ActorId`, format it as `name[pid]`;
 /// otherwise fall back to showing the raw reference.
 pub(crate) fn derive_label_from_ref(reference: &str) -> String {
-    match ActorId::from_str(reference) {
+    match hyperactor_reference::ActorId::from_str(reference) {
         Ok(actor_id) => format!("{}[{}]", actor_id.name(), actor_id.pid()),
         Err(_) => reference.to_string(),
     }
@@ -225,8 +210,8 @@ pub(crate) fn format_uptime(started_at: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use hyperactor::introspect::NodePayload;
-    use hyperactor::introspect::NodeProperties;
+    use hyperactor_mesh::introspect::NodePayload;
+    use hyperactor_mesh::introspect::NodeProperties;
     use serde_json::Value;
 
     use super::*;
@@ -261,7 +246,7 @@ mod tests {
             parent: None,
             as_of: "".to_string(),
         };
-        assert_eq!(derive_label(&payload), "10.0.0.1:8000  (3 procs: 3 user)");
+        assert_eq!(derive_label(&payload), "10.0.0.1:8000  (3 procs)");
     }
 
     #[test]
@@ -277,10 +262,7 @@ mod tests {
             parent: None,
             as_of: "".to_string(),
         };
-        assert_eq!(
-            derive_label(&payload),
-            "10.0.0.1:8000  (5 procs: 3 user, 2 system)"
-        );
+        assert_eq!(derive_label(&payload), "10.0.0.1:8000  (5 procs)");
     }
 
     #[test]
@@ -296,7 +278,7 @@ mod tests {
             parent: None,
             as_of: "".to_string(),
         };
-        assert_eq!(derive_label(&payload), "10.0.0.1:8000  (2 procs: 2 system)");
+        assert_eq!(derive_label(&payload), "10.0.0.1:8000  (2 procs)");
     }
 
     #[test]
@@ -306,7 +288,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 4,
-                is_system: false,
+
                 system_children: vec![],
                 stopped_children: vec![],
                 stopped_retention_cap: 0,
@@ -317,7 +299,7 @@ mod tests {
             parent: None,
             as_of: "".to_string(),
         };
-        assert_eq!(derive_label(&payload), "myproc  (4 actors: 4 live)");
+        assert_eq!(derive_label(&payload), "myproc  (4 actors: 4 user)");
     }
 
     #[test]
@@ -327,7 +309,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 5,
-                is_system: false,
+
                 system_children: vec!["sys1".into(), "sys2".into()],
                 stopped_children: vec![],
                 stopped_retention_cap: 0,
@@ -340,7 +322,7 @@ mod tests {
         };
         assert_eq!(
             derive_label(&payload),
-            "myproc  (5 actors: 2 system, 3 live)"
+            "myproc  (5 actors: 2 system, 3 user)"
         );
     }
 
@@ -351,7 +333,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 3,
-                is_system: false,
+
                 system_children: vec![],
                 stopped_children: vec!["s1".into(), "s2".into()],
                 stopped_retention_cap: 100,
@@ -364,7 +346,7 @@ mod tests {
         };
         assert_eq!(
             derive_label(&payload),
-            "myproc  (5 actors: 3 live, 2 stopped)"
+            "myproc  (5 actors: 3 user, 2 stopped)"
         );
     }
 
@@ -375,7 +357,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 1,
-                is_system: false,
+
                 system_children: vec![],
                 stopped_children: vec!["s1".into(), "s2".into(), "s3".into()],
                 stopped_retention_cap: 3,
@@ -396,7 +378,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 0,
-                is_system: false,
+
                 system_children: vec![],
                 stopped_children: vec!["s1".into()],
                 stopped_retention_cap: 0,
@@ -413,13 +395,13 @@ mod tests {
     }
 
     #[test]
-    fn derive_label_proc_system_and_stopped_and_live() {
+    fn derive_label_proc_system_and_stopped_and_user() {
         let payload = NodePayload {
             identity: "myproc".to_string(),
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 5,
-                is_system: false,
+
                 system_children: vec!["sys1".into()],
                 stopped_children: vec!["dead1".into(), "dead2".into()],
                 stopped_retention_cap: 100,
@@ -432,18 +414,18 @@ mod tests {
         };
         assert_eq!(
             derive_label(&payload),
-            "myproc  (7 actors: 1 system, 4 live, 2 stopped)"
+            "myproc  (7 actors: 1 system, 4 user, 2 stopped)"
         );
     }
 
     #[test]
-    fn derive_label_proc_all_stopped_none_live() {
+    fn derive_label_proc_all_stopped_none_user() {
         let payload = NodePayload {
             identity: "myproc".to_string(),
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 0,
-                is_system: false,
+
                 system_children: vec![],
                 stopped_children: vec!["d1".into(), "d2".into()],
                 stopped_retention_cap: 100,
@@ -464,7 +446,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 1,
-                is_system: false,
+
                 system_children: vec!["s1".into(), "s2".into(), "s3".into()],
                 stopped_children: vec![],
                 stopped_retention_cap: 0,
@@ -477,7 +459,7 @@ mod tests {
         };
         let label = derive_label(&payload);
         assert!(label.contains("3 system"));
-        assert!(!label.contains("live"));
+        assert!(!label.contains("user"));
     }
 
     #[test]
@@ -487,7 +469,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 2,
-                is_system: false,
+
                 system_children: vec![],
                 stopped_children: vec!["dead1".into()],
                 stopped_retention_cap: 100,
@@ -509,7 +491,7 @@ mod tests {
             properties: NodeProperties::Proc {
                 proc_name: "myproc".to_string(),
                 num_actors: 3,
-                is_system: false,
+
                 system_children: vec![],
                 stopped_children: vec![],
                 stopped_retention_cap: 100,
@@ -536,8 +518,8 @@ mod tests {
                 last_message_handler: Some("handle_task".to_string()),
                 total_processing_time_us: 1000,
                 flight_recorder: None,
-                is_system: false,
                 failure_info: None,
+                is_system: false,
             },
             children: vec![],
             parent: Some("unix:@abc123,myworld".to_string()),
@@ -558,8 +540,8 @@ mod tests {
                 last_message_handler: None,
                 total_processing_time_us: 0,
                 flight_recorder: None,
-                is_system: false,
                 failure_info: None,
+                is_system: false,
             },
             children: vec![],
             parent: None,

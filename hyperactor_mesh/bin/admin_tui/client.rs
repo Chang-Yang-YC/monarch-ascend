@@ -18,35 +18,14 @@
 //!
 //! # MAST resolution invariants
 //!
-//! - **INV-DISPATCH**: In fbcode builds, the `--mast-resolver` CLI
-//!   arg selects the strategy via [`MastResolver`]. Default is
+//! - **MR-1 (dispatch):** In fbcode builds, the `--mast-resolver`
+//!   CLI arg selects the strategy via [`MastResolver`]. Default is
 //!   thrift; `"cli"` selects CLI. In OSS builds, CLI always.
 //!
-//! - **INV-CLI-CONTRACT**: The CLI resolver requires `mast
-//!   get-status --json <job>` to exit 0 and produce valid JSON. A
-//!   missing binary produces a distinct "not found" error. Non-zero
-//!   exit includes the exit code and stderr. Malformed JSON produces
-//!   a parse error with context.
+//! See `mesh_admin.rs` for MC-1..MC-5 (CLI contract, hostname
+//! extraction, FQDN qualification, admin port resolution).
 //!
-//! - **INV-HEAD-HOSTNAME**: [`head_hostname`] extracts the first
-//!   hostname by ascending task index. For each task group, the last
-//!   attempt is selected. For each task, the last execution attempt
-//!   is selected. Task indices are parsed from map keys as integers
-//!   and sorted ascending. Empty result is a fatal error.
-//!
-//! - **INV-FQDN-IDEMPOTENT**: [`qualify_fqdn`] is idempotent. A
-//!   hostname containing a dot passes through (or resolves to
-//!   itself). A short hostname is qualified via
-//!   `getaddrinfo(AI_CANONNAME)`. Failure falls back to the raw
-//!   hostname.
-//!
-//! - **INV-FQDN-NONBLOCKING**: [`qualify_fqdn`] runs the blocking
-//!   `getaddrinfo` syscall via `spawn_blocking`, never on a tokio
-//!   worker thread.
-//!
-//! - **INV-ADMIN-PORT**: [`resolve_admin_port`] uses the explicit
-//!   override when provided, otherwise reads the port from
-//!   `MESH_ADMIN_ADDR` config.
+//! See mesh_admin.rs module doc for MC-5.
 //!
 //! # Address handling
 //!
@@ -63,16 +42,17 @@
 //!    locations.
 //! 3. Fallback to plain HTTP when no usable CA is found.
 //!
-//! When TLS is enabled, the returned client verifies the server
-//! certificate against the configured CA. When mutual TLS material is
-//! present, a client identity is attached on a best-effort basis
-//! (failure to parse the identity does not disable TLS).
+//! **Note:** At Meta (`fbcode_build`), the mesh admin server requires
+//! mutual TLS. If the client cannot load a CA certificate or fails to
+//! parse a client identity, the connection will be rejected at the TLS
+//! handshake. In OSS, the server falls back to plain HTTP when no
+//! certs are available, so the client's HTTP fallback still works.
 
 use std::time::Duration;
 
 use crate::theme::Args;
 
-// -- MAST resolution dispatch (INV-DISPATCH) --
+// -- MAST resolution dispatch (MR-1) --
 //
 // `MastResolver` is defined locally in each binary (here and in
 // `hyper`) rather than in `hyperactor_mesh`, to avoid pulling
@@ -113,14 +93,14 @@ impl MastResolver {
 }
 
 /// Resolve a `mast_conda:///<job-name>` handle to an
-/// `https://fqdn:port` URL (INV-DISPATCH).
+/// `https://fqdn:port` URL (MR-1).
 ///
 /// Two resolution strategies exist, selected by `MastResolver`:
 ///
 /// - `Cli`: shells out to `mast get-status --json`
 ///   (`hyperactor_mesh::mesh_admin::resolve_mast_handle`). Implements
-///   INV-CLI-CONTRACT, INV-HEAD-HOSTNAME, INV-FQDN-IDEMPOTENT,
-///   INV-FQDN-NONBLOCKING.
+///   MC-1, MC-2, MC-3,
+///   MC-4.
 ///
 /// - `Thrift` (fbcode only): queries the MAST HPC scheduler via
 ///   Thrift (`hyperactor_meta::mesh_admin::resolve_mast_handle`).
@@ -206,11 +186,69 @@ fn add_tls(
     let mut builder = builder.add_root_certificate(root_cert);
 
     if let (Some(cert), Some(key)) = (cert_bytes, key_bytes) {
-        let mut id_pem = cert;
-        id_pem.extend_from_slice(&key);
-        match reqwest::Identity::from_pem(&id_pem) {
-            Ok(identity) => builder = builder.identity(identity),
-            Err(e) => eprintln!("TLS: invalid client identity PEM: {}", e),
+        // reqwest's Identity type is backend-specific: from_pkcs8_pem
+        // creates a native-tls identity, from_pem creates a rustls
+        // identity. When both features are compiled (fbcode Buck builds),
+        // using the wrong variant silently fails at connect time with
+        // "incompatible TLS identity type".
+        //
+        // Meta's server.pem bundles certs + key in one file.
+        // from_pkcs8_pem requires the key as a separate buffer, so we
+        // split it out by finding the private key marker.
+        let combined = if cert == key {
+            cert
+        } else {
+            let mut c = cert;
+            c.extend_from_slice(&key);
+            c
+        };
+        let identity_result = {
+            // Split PEM into cert-only and key-only buffers for native-tls.
+            // reqwest 0.11 with both native-tls and rustls features compiled
+            // (fbcode Buck builds) defaults to the native-tls connector.
+            // Identity::from_pem creates a rustls-flavored identity that is
+            // silently rejected by native-tls at connect time. We must use
+            // from_pkcs8_pem (native-tls) in fbcode, and from_pem (rustls)
+            // in OSS where native-tls is excluded (D93626607).
+            let combined_str = String::from_utf8_lossy(&combined);
+            let key_markers = [
+                // @lint-ignore PRIVATEKEY
+                "-----BEGIN PRIVATE KEY-----",
+                // @lint-ignore PRIVATEKEY
+                "-----BEGIN RSA PRIVATE KEY-----",
+                // @lint-ignore PRIVATEKEY
+                "-----BEGIN EC PRIVATE KEY-----",
+            ];
+            let key_pos = key_markers
+                .iter()
+                .filter_map(|m| combined_str.find(m))
+                .min();
+            #[cfg(fbcode_build)]
+            {
+                if let Some(key_start) = key_pos {
+                    let cert_pem = combined_str[..key_start].trim().as_bytes();
+                    let key_pem = combined_str[key_start..].trim().as_bytes();
+                    reqwest::Identity::from_pkcs8_pem(cert_pem, key_pem)
+                } else {
+                    reqwest::Identity::from_pem(&combined)
+                }
+            }
+            #[cfg(not(fbcode_build))]
+            {
+                let _ = key_pos; // suppress unused warning
+                reqwest::Identity::from_pem(&combined)
+            }
+        };
+        match identity_result {
+            Ok(identity) => {
+                builder = builder.identity(identity);
+            }
+            Err(e) => eprintln!(
+                "WARNING: TLS: failed to parse client identity PEM: {}. \
+                 The mesh admin server requires mTLS — connection will fail \
+                 without a valid client certificate.",
+                e
+            ),
         }
     }
 
@@ -293,9 +331,11 @@ fn add_tls_from_bundle(
 /// 1. If `--tls-ca` is provided, attempt to load the CA (and
 ///    optionally `--tls-cert` + `--tls-key` for a client identity)
 ///    from those paths.
-/// 2. Otherwise, if no explicit scheme was given, try auto-detection
-///    via [`hyperactor::channel::try_tls_pem_bundle`] (OSS config
-///    first, then Meta well-known paths).
+/// 2. Otherwise, if no `--tls-ca` was given, try auto-detection via
+///    [`hyperactor::channel::try_tls_pem_bundle`] (OSS config first,
+///    then Meta well-known paths). This runs even when the user
+///    provides an explicit `https://` scheme, so the mTLS client
+///    identity is picked up from well-known paths.
 /// 3. If no CA can be loaded, fall back to plain HTTP.
 ///
 /// Returns `(base_url, client)` where `base_url` always includes the
@@ -318,12 +358,14 @@ pub(crate) fn build_client(args: &Args) -> (String, reqwest::Client) {
         use_tls = use_tls || ok;
     }
 
-    // 2. Auto-detect (only when no explicit scheme or CLI certs).
-    if explicit_scheme.is_none() && !use_tls {
+    // 2. Auto-detect (when no CLI certs were provided).
+    // This runs even with an explicit https:// scheme, so the client
+    // picks up the mTLS identity from Meta well-known paths.
+    if args.tls_ca.is_none() {
         if let Some(bundle) = hyperactor::channel::try_tls_pem_bundle() {
             let (b, ok) = add_tls_from_bundle(builder, &bundle);
             builder = b;
-            use_tls = ok;
+            use_tls = use_tls || ok;
         }
     }
 

@@ -27,7 +27,6 @@ use enum_as_inner::EnumAsInner;
 use hyperactor::Bind;
 use hyperactor::HandleClient;
 use hyperactor::Handler;
-use hyperactor::PortRef;
 use hyperactor::RefClient;
 use hyperactor::RemoteMessage;
 use hyperactor::Unbind;
@@ -35,6 +34,7 @@ use hyperactor::mailbox::PortReceiver;
 use hyperactor::message::Bind;
 use hyperactor::message::Bindings;
 use hyperactor::message::Unbind;
+use hyperactor::reference as hyperactor_reference;
 use hyperactor_config::attrs::Attrs;
 use ndslice::Region;
 use ndslice::ViewExt;
@@ -45,6 +45,7 @@ use typeuri::Named;
 use crate::Name;
 use crate::StatusOverlay;
 use crate::bootstrap;
+use crate::bootstrap::ProcBind;
 use crate::host_mesh::host_agent::ProcState;
 use crate::proc_agent::ActorSpec;
 use crate::proc_agent::ActorState;
@@ -176,7 +177,7 @@ pub struct GetRankStatus {
     pub name: Name,
     /// Sparse status updates (overlays) from a rank.
     #[binding(include)]
-    pub reply: PortRef<StatusOverlay>,
+    pub reply: hyperactor_reference::PortRef<StatusOverlay>,
 }
 
 impl GetRankStatus {
@@ -318,7 +319,7 @@ pub struct GetState<S> {
     pub name: Name,
     /// A reply containing the state.
     #[reply]
-    pub reply: PortRef<State<S>>,
+    pub reply: hyperactor_reference::PortRef<State<S>>,
 }
 wirevalue::register_type!(GetState<ProcState>);
 wirevalue::register_type!(GetState<ActorState>);
@@ -406,7 +407,7 @@ where
 pub struct List {
     /// List of resource names managed by this controller.
     #[reply]
-    pub reply: PortRef<Vec<Name>>,
+    pub reply: hyperactor_reference::PortRef<Vec<Name>>,
 }
 wirevalue::register_type!(List);
 
@@ -679,13 +680,16 @@ pub(crate) struct ProcSpec {
     /// Config values to set on the spawned proc's global config,
     /// at the `ClientOverride` layer.
     pub(crate) client_config_override: Attrs,
+    /// Optional per-process CPU/NUMA binding configuration.
+    pub(crate) proc_bind: Option<ProcBind>,
 }
 wirevalue::register_type!(ProcSpec);
 
 impl ProcSpec {
-    pub(crate) fn new(client_config_override: Attrs) -> Self {
+    pub(crate) fn new(client_config_override: Attrs, proc_bind: Option<ProcBind>) -> Self {
         Self {
             client_config_override,
+            proc_bind,
         }
     }
 }

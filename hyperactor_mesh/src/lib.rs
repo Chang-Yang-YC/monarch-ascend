@@ -28,8 +28,9 @@ pub mod casting;
 pub mod comm;
 pub mod config;
 pub mod connect;
-pub mod global_client;
+pub mod global_context;
 pub mod host_mesh;
+pub mod introspect;
 pub mod logging;
 pub mod mesh;
 pub mod mesh_admin;
@@ -42,7 +43,6 @@ pub mod proc_launcher;
 pub mod proc_mesh;
 pub mod reference;
 pub mod resource;
-pub mod router;
 pub mod shared_cell;
 pub mod shortuuid;
 pub mod supervision;
@@ -67,12 +67,12 @@ pub use casting::CastError;
 pub use comm::CommActor;
 pub use dashmap;
 use enum_as_inner::EnumAsInner;
-pub use global_client::GlobalClientActor;
-pub use global_client::global_root_client;
+pub use global_context::GlobalClientActor;
+pub use global_context::GlobalContext;
+pub use global_context::context;
+pub use global_context::this_host;
+pub use global_context::this_proc;
 pub use host_mesh::HostMeshRef;
-use hyperactor::ActorId;
-use hyperactor::ActorRef;
-use hyperactor::ProcId;
 use hyperactor::host::HostError;
 use hyperactor::mailbox::MailboxSenderError;
 use hyperactor::reference as hyperactor_reference;
@@ -148,7 +148,7 @@ pub enum Error {
     UnroutableMesh(),
 
     #[error("error while calling actor {0}: {1}")]
-    CallError(ActorId, anyhow::Error),
+    CallError(hyperactor_reference::ActorId, anyhow::Error),
 
     #[error("actor not registered for type {0}")]
     ActorTypeNotRegistered(String),
@@ -158,13 +158,13 @@ pub enum Error {
     GspawnError(Name, String),
 
     #[error("error while sending message to actor {0}: {1}")]
-    SendingError(ActorId, Box<MailboxSenderError>),
+    SendingError(hyperactor_reference::ActorId, Box<MailboxSenderError>),
 
     #[error("error while casting message to {0}: {1}")]
     CastingError(Name, anyhow::Error),
 
     #[error("error configuring host mesh agent {0}: {1}")]
-    HostMeshAgentConfigurationError(ActorId, String),
+    HostMeshAgentConfigurationError(hyperactor_reference::ActorId, String),
 
     #[error(
         "error creating proc (host rank {host_rank}) on host mesh agent {mesh_agent}, state: {state}"
@@ -172,7 +172,7 @@ pub enum Error {
     ProcCreationError {
         state: Box<resource::State<ProcState>>,
         host_rank: usize,
-        mesh_agent: ActorRef<HostAgent>,
+        mesh_agent: hyperactor_reference::ActorRef<HostAgent>,
     },
 
     #[error(
@@ -200,7 +200,7 @@ pub enum Error {
     ControllerActorSpawnError(Name, anyhow::Error),
 
     #[error("proc {0} must be direct-addressable")]
-    RankedProc(ProcId),
+    RankedProc(hyperactor_reference::ProcId),
 
     #[error("{0}")]
     Supervision(Box<MeshFailure>),

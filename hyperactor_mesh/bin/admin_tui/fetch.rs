@@ -12,10 +12,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use algebra::JoinSemilattice;
-use hyperactor::clock::Clock;
-use hyperactor::clock::RealClock;
-use hyperactor::introspect::NodePayload;
-use hyperactor::introspect::NodeProperties;
+use hyperactor_mesh::introspect::NodePayload;
+use hyperactor_mesh::introspect::NodeProperties;
 
 use crate::filter::is_failed_node;
 use crate::filter::is_stopped_node;
@@ -27,7 +25,7 @@ use crate::model::TreeNode;
 
 /// Monotonic ordering key for fetch results.
 ///
-/// `ts_micros` comes from wall-clock time (RealClock) and `seq`
+/// `ts_micros` comes from wall-clock time and `seq`
 /// breaks ties to ensure a total order within this process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Stamp {
@@ -138,8 +136,7 @@ pub(crate) async fn fetch_with_join(
     if should_fetch {
         // Generate stamp.
         *seq_counter += 1;
-        let ts_micros = RealClock
-            .system_time_now()
+        let ts_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
@@ -224,6 +221,7 @@ pub(crate) fn build_tree_node<'a>(
     reference: &'a str,
     depth: usize,
     expanded_keys: &'a HashSet<(String, usize)>,
+    failed_keys: &'a HashSet<(String, usize)>,
     refresh_gen: u64,
     seq_counter: &'a mut u64,
 ) -> Pin<Box<dyn Future<Output = Option<TreeNode>> + Send + 'a>> {
@@ -266,7 +264,7 @@ pub(crate) fn build_tree_node<'a>(
             return None;
         }
 
-        // Filter stopped actors (failed nodes always visible).
+        // TUI-4: failed nodes always visible.
         if !show_stopped
             && is_stopped_node(&payload.properties)
             && !is_failed_node(&payload.properties)
@@ -329,13 +327,18 @@ pub(crate) fn build_tree_node<'a>(
                 let child_is_stopped = stopped_children.contains(child_ref.as_str());
                 let child_is_system = system_children.contains(child_ref.as_str());
 
-                // Failed nodes are always visible (never filtered by show_stopped).
+                // TUI-4: failed nodes always visible.
                 // If the parent proc is poisoned, its stopped children may be
                 // failed — don't filter them out (cache may be empty on first load).
-                let child_is_failed = parent_is_poisoned
-                    || get_cached_payload(cache, child_ref)
-                        .is_some_and(|c| is_failed_node(&c.properties));
-                if !show_stopped && child_is_stopped && !child_is_failed {
+                // A child is known-failed from its cached payload, or
+                // inferred-failed if it is stopped on a poisoned proc
+                // (the failure that poisoned the proc likely stopped it).
+                let child_cached_failed = get_cached_payload(cache, child_ref)
+                    .is_some_and(|c| is_failed_node(&c.properties));
+                let child_cached_failed =
+                    child_cached_failed || (parent_is_poisoned && child_is_stopped);
+                let child_maybe_failed = parent_is_poisoned || child_cached_failed;
+                if !show_stopped && child_is_stopped && !child_maybe_failed {
                     continue;
                 }
 
@@ -356,6 +359,7 @@ pub(crate) fn build_tree_node<'a>(
                             child_ref,
                             depth + 1,
                             expanded_keys,
+                            failed_keys,
                             refresh_gen,
                             seq_counter,
                         )
@@ -374,14 +378,17 @@ pub(crate) fn build_tree_node<'a>(
                                 }
                                 let mut node = TreeNode::from_payload(child_ref.clone(), cached);
                                 node.stopped = node.stopped || child_is_stopped;
+                                node.failed = node.failed || child_cached_failed;
                                 node.is_system = node.is_system || child_is_system;
                                 children.push(node);
                             } else if child_is_stopped {
                                 let mut node = TreeNode::placeholder_stopped(child_ref.clone());
+                                node.failed = child_cached_failed;
                                 node.is_system = child_is_system;
                                 children.push(node);
                             } else {
                                 let mut node = TreeNode::placeholder(child_ref.clone());
+                                node.failed = child_cached_failed;
                                 node.is_system = child_is_system;
                                 children.push(node);
                             }
@@ -398,14 +405,17 @@ pub(crate) fn build_tree_node<'a>(
                             }
                             let mut node = TreeNode::from_payload(child_ref.clone(), cached);
                             node.stopped = node.stopped || child_is_stopped;
+                            node.failed = node.failed || child_cached_failed;
                             node.is_system = node.is_system || child_is_system;
                             children.push(node);
                         } else if child_is_stopped {
                             let mut node = TreeNode::placeholder_stopped(child_ref.clone());
+                            node.failed = child_cached_failed;
                             node.is_system = child_is_system;
                             children.push(node);
                         } else {
                             let mut node = TreeNode::placeholder(child_ref.clone());
+                            node.failed = child_cached_failed;
                             node.is_system = child_is_system;
                             children.push(node);
                         }
@@ -422,6 +432,7 @@ pub(crate) fn build_tree_node<'a>(
                         child_ref,
                         depth + 1,
                         expanded_keys,
+                        failed_keys,
                         refresh_gen,
                         seq_counter,
                     )
@@ -433,11 +444,15 @@ pub(crate) fn build_tree_node<'a>(
             }
         }
 
-        // A node is failed if it has failure info itself (actor with
-        // failure_info, poisoned proc) OR if any of its children are
-        // failed.  This propagates the unhealthy state upward so that
-        // host and root nodes render red when the mesh contains failures.
-        let children_failed = children.iter().any(|c| c.failed);
+        // Failure propagation: expanded nodes recompute from live
+        // children; collapsed nodes carry forward prior state.
+        let children_failed = if is_expanded {
+            // Live: authoritative recomputation from fetched children.
+            children.iter().any(|c| c.failed)
+        } else {
+            // Carried: children not built this cycle — inherit prior.
+            failed_keys.contains(&(reference.to_string(), depth))
+        };
         let node = TreeNode {
             reference: reference.to_string(),
             label,
@@ -498,8 +513,8 @@ pub(crate) fn extract_trailing_index(s: &str) -> Option<(&str, u64)> {
 #[cfg(test)]
 mod tests {
     use algebra::JoinSemilattice;
-    use hyperactor::introspect::NodePayload;
-    use hyperactor::introspect::NodeProperties;
+    use hyperactor_mesh::introspect::NodePayload;
+    use hyperactor_mesh::introspect::NodeProperties;
 
     use super::*;
 

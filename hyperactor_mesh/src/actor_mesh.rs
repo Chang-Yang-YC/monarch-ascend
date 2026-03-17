@@ -6,6 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+//! ## Actor mesh invariants (AM-*)
+//!
+//! - **AM-1 (rank-space):** `proc_mesh` and any view derived from
+//!   it share the same dense rank space.
+
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
@@ -16,19 +21,16 @@ use std::sync::OnceLock as OnceCell;
 use std::time::Duration;
 
 use hyperactor::ActorLocal;
-use hyperactor::ActorRef;
-use hyperactor::PortRef;
 use hyperactor::RemoteHandles;
 use hyperactor::RemoteMessage;
 use hyperactor::actor::ActorStatus;
 use hyperactor::actor::Referable;
-use hyperactor::clock::Clock;
-use hyperactor::clock::RealClock;
 use hyperactor::context;
 use hyperactor::mailbox::PortReceiver;
 use hyperactor::message::Castable;
 use hyperactor::message::IndexedErasedUnbound;
 use hyperactor::message::Unbound;
+use hyperactor::reference as hyperactor_reference;
 use hyperactor::supervision::ActorSupervisionEvent;
 use hyperactor_config::CONFIG;
 use hyperactor_config::ConfigAttr;
@@ -85,7 +87,7 @@ declare_attrs! {
 /// An ActorMesh is a collection of ranked A-typed actors.
 ///
 /// Bound note: `A: Referable` because the mesh stores/returns
-/// `ActorRef<A>`, which is only defined for `A: Referable`.
+/// `hyperactor_reference::ActorRef<A>`, which is only defined for `A: Referable`.
 #[derive(Debug)]
 pub struct ActorMesh<A: Referable> {
     proc_mesh: ProcMeshRef,
@@ -96,16 +98,16 @@ pub struct ActorMesh<A: Referable> {
     /// supervision events via subscribing.
     /// It may not be present for some types of actors, typically system actors
     /// such as ProcAgent or CommActor.
-    controller: Option<ActorRef<ActorMeshController<A>>>,
+    controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
 }
 
 // `A: Referable` for the same reason as the struct: the mesh holds
-// `ActorRef<A>`.
+// `hyperactor_reference::ActorRef<A>`.
 impl<A: Referable> ActorMesh<A> {
     pub(crate) fn new(
         proc_mesh: ProcMeshRef,
         name: Name,
-        controller: Option<ActorRef<ActorMeshController<A>>>,
+        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
     ) -> Self {
         let current_ref = ActorMeshRef::with_page_size(
             name.clone(),
@@ -126,7 +128,10 @@ impl<A: Referable> ActorMesh<A> {
         &self.name
     }
 
-    pub(crate) fn set_controller(&mut self, controller: Option<ActorRef<ActorMeshController<A>>>) {
+    pub(crate) fn set_controller(
+        &mut self,
+        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+    ) {
         self.controller = controller.clone();
         self.current_ref.set_controller(controller);
     }
@@ -260,7 +265,7 @@ const DEFAULT_PAGE: usize = 1024;
 
 /// A lazily materialized page of ActorRefs.
 struct Page<A: Referable> {
-    slots: Box<[OnceCell<ActorRef<A>>]>,
+    slots: Box<[OnceCell<hyperactor_reference::ActorRef<A>>]>,
 }
 
 impl<A: Referable> Page<A> {
@@ -336,7 +341,7 @@ fn into_watch<M: Send + Sync + Clone + Default + 'static>(
     }
     tokio::spawn(async move {
         loop {
-            let message = match RealClock.timeout(timeout, rx.recv()).await {
+            let message = match tokio::time::timeout(timeout, rx.recv()).await {
                 Ok(Ok(msg)) => MessageOrFailure::Message(msg),
                 Ok(Err(e)) => MessageOrFailure::Failure(e.to_string()),
                 Err(_) => MessageOrFailure::Timeout,
@@ -368,7 +373,7 @@ pub struct ActorMeshRef<A: Referable> {
     /// not be stopped. If Some, the actor mesh may still be stopped, and the
     /// next_supervision_event function can be used to alert that the mesh has
     /// stopped.
-    controller: Option<ActorRef<ActorMeshController<A>>>,
+    controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
 
     /// Recorded health issues with the mesh, to quickly consult before sending
     /// out any casted messages. This is a locally updated copy of the authoritative
@@ -381,7 +386,7 @@ pub struct ActorMeshRef<A: Referable> {
     receiver: ActorLocal<
         Arc<
             tokio::sync::Mutex<(
-                PortRef<Option<MeshFailure>>,
+                hyperactor_reference::PortRef<Option<MeshFailure>>,
                 watch::Receiver<MessageOrFailure<Option<MeshFailure>>>,
             )>,
         >,
@@ -392,7 +397,7 @@ pub struct ActorMeshRef<A: Referable> {
     /// - The `Vec` holds slots for multiple pages.
     /// - Each slot is itself a `OnceCell<Box<Page<A>>>`, so that each
     ///   page can be initialized on demand.
-    /// - A `Page<A>` is a boxed slice of `OnceCell<ActorRef<A>>`,
+    /// - A `Page<A>` is a boxed slice of `OnceCell<hyperactor_reference::ActorRef<A>>`,
     ///   i.e. the actual storage for actor references within that
     ///   page.
     pages: OnceCell<Vec<OnceCell<Box<Page<A>>>>>,
@@ -461,7 +466,7 @@ impl<A: Referable> ActorMeshRef<A> {
         }
 
         hyperactor_telemetry::notify_sent_message(hyperactor_telemetry::SentMessageEvent {
-            timestamp: RealClock.system_time_now(),
+            timestamp: std::time::SystemTime::now(),
             sender_actor_id: hyperactor_telemetry::hash_to_u64(cx.mailbox().actor_id()),
             actor_mesh_id: hyperactor_telemetry::hash_to_u64(&self.name.to_string()),
             view_json: serde_json::to_string(view::Ranked::region(self)).unwrap_or_default(),
@@ -478,11 +483,11 @@ impl<A: Referable> ActorMeshRef<A> {
             for (point, actor) in self.iter() {
                 let create_rank = point.rank();
                 let mut headers = Flattrs::new();
-                headers.set(
-                    multicast::CAST_ORIGINATING_SENDER,
+                multicast::set_cast_info_on_headers(
+                    &mut headers,
+                    point,
                     cx.instance().self_id().clone(),
                 );
-                headers.set(multicast::CAST_POINT, point);
 
                 // Make sure that we re-bind ranks, as these may be used for
                 // bootstrapping comm actors.
@@ -511,7 +516,7 @@ impl<A: Referable> ActorMeshRef<A> {
         cx: &impl context::Actor,
         message: M,
         sel: Selection,
-        root_comm_actor: &ActorRef<CommActor>,
+        root_comm_actor: &hyperactor_reference::ActorRef<CommActor>,
     ) -> crate::Result<()>
     where
         A: RemoteHandles<IndexedErasedUnbound<M>>,
@@ -573,7 +578,7 @@ impl<A: Referable> ActorMeshRef<A> {
     pub(crate) fn new(
         name: Name,
         proc_mesh: ProcMeshRef,
-        controller: Option<ActorRef<ActorMeshController<A>>>,
+        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
     ) -> Self {
         Self::with_page_size(name, proc_mesh, DEFAULT_PAGE, controller)
     }
@@ -586,7 +591,7 @@ impl<A: Referable> ActorMeshRef<A> {
         name: Name,
         proc_mesh: ProcMeshRef,
         page_size: usize,
-        controller: Option<ActorRef<ActorMeshController<A>>>,
+        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
     ) -> Self {
         Self {
             proc_mesh,
@@ -608,11 +613,14 @@ impl<A: Referable> ActorMeshRef<A> {
         view::Ranked::region(&self.proc_mesh).num_ranks()
     }
 
-    pub fn controller(&self) -> &Option<ActorRef<ActorMeshController<A>>> {
+    pub fn controller(&self) -> &Option<hyperactor_reference::ActorRef<ActorMeshController<A>>> {
         &self.controller
     }
 
-    fn set_controller(&mut self, controller: Option<ActorRef<ActorMeshController<A>>>) {
+    fn set_controller(
+        &mut self,
+        controller: Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+    ) {
         self.controller = controller;
     }
 
@@ -622,7 +630,7 @@ impl<A: Referable> ActorMeshRef<A> {
             .get_or_init(|| (0..n).map(|_| OnceCell::new()).collect())
     }
 
-    fn materialize(&self, rank: usize) -> Option<&ActorRef<A>> {
+    fn materialize(&self, rank: usize) -> Option<&hyperactor_reference::ActorRef<A>> {
         let len = self.len();
         if rank >= len {
             return None;
@@ -641,8 +649,7 @@ impl<A: Referable> ActorMeshRef<A> {
         });
 
         Some(page.slots[local_ix].get_or_init(|| {
-            // Invariant: `proc_mesh` and this view share the same
-            // dense rank space:
+            // AM-1: see module doc.
             //   - ranks are contiguous [0, self.len()) with no gaps
             //     or reordering
             //   - for every rank r, `proc_mesh.get(r)` is Some(..)
@@ -660,10 +667,10 @@ impl<A: Referable> ActorMeshRef<A> {
     }
 
     fn init_supervision_receiver(
-        controller: &ActorRef<ActorMeshController<A>>,
+        controller: &hyperactor_reference::ActorRef<ActorMeshController<A>>,
         cx: &impl context::Actor,
     ) -> (
-        PortRef<Option<MeshFailure>>,
+        hyperactor_reference::PortRef<Option<MeshFailure>>,
         watch::Receiver<MessageOrFailure<Option<MeshFailure>>>,
     ) {
         let (tx, rx) = cx.mailbox().open_port();
@@ -876,10 +883,11 @@ impl<'de, A: Referable> Deserialize<'de> for ActorMeshRef<A> {
     where
         D: Deserializer<'de>,
     {
-        let (proc_mesh, name, controller) =
-            <(ProcMeshRef, Name, Option<ActorRef<ActorMeshController<A>>>)>::deserialize(
-                deserializer,
-            )?;
+        let (proc_mesh, name, controller) = <(
+            ProcMeshRef,
+            Name,
+            Option<hyperactor_reference::ActorRef<ActorMeshController<A>>>,
+        )>::deserialize(deserializer)?;
         Ok(ActorMeshRef::with_page_size(
             name,
             proc_mesh,
@@ -890,7 +898,7 @@ impl<'de, A: Referable> Deserialize<'de> for ActorMeshRef<A> {
 }
 
 impl<A: Referable> view::Ranked for ActorMeshRef<A> {
-    type Item = ActorRef<A>;
+    type Item = hyperactor_reference::ActorRef<A>;
 
     #[inline]
     fn region(&self) -> &Region {
@@ -926,8 +934,6 @@ mod tests {
 
     use hyperactor::actor::ActorErrorKind;
     use hyperactor::actor::ActorStatus;
-    use hyperactor::clock::Clock;
-    use hyperactor::clock::RealClock;
     use hyperactor::context::Mailbox as _;
     use hyperactor::mailbox;
     use ndslice::Extent;
@@ -961,7 +967,10 @@ mod tests {
         // Small mesh so the test runs fast, but > page_size so we
         // cross a boundary
         let mut hm = testing::host_mesh(3).await;
-        let pm: ProcMesh = hm.spawn(instance, "test", extent!(gpus = 2)).await.unwrap();
+        let pm: ProcMesh = hm
+            .spawn(instance, "test", extent!(gpus = 2), None)
+            .await
+            .unwrap();
         let am: ActorMesh<testactor::TestActor> = pm.spawn(instance, "test", &()).await.unwrap();
 
         // 2) Build our ActorMeshRef with a tiny page size (2) to
@@ -1036,13 +1045,11 @@ mod tests {
             .expect("rank 3 exists")
             .send(instance, testactor::GetActorId(port.bind()))
             .expect("send to rank 3 should succeed");
-        let id_a = RealClock
-            .timeout(Duration::from_secs(3), rx.recv())
+        let id_a = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .expect("timed out waiting for first reply")
             .expect("channel closed before first reply");
-        let id_b = RealClock
-            .timeout(Duration::from_secs(3), rx.recv())
+        let id_b = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .expect("timed out waiting for second reply")
             .expect("channel closed before second reply");
@@ -1062,7 +1069,10 @@ mod tests {
         let supervisor = supervision_port.bind();
         let num_replicas = 4;
         let mut hm = testing::host_mesh(num_replicas).await;
-        let proc_mesh = hm.spawn(instance, "test", Extent::unity()).await.unwrap();
+        let proc_mesh = hm
+            .spawn(instance, "test", Extent::unity(), None)
+            .await
+            .unwrap();
         let child_name = Name::new("child").unwrap();
 
         // Need to use a wrapper as there's no way to customize the handler for MeshFailure
@@ -1127,11 +1137,11 @@ mod tests {
 
         // Wait for a supervision event to reach the wrapper actor.
         for _ in 0..num_replicas {
-            let failure = RealClock
-                .timeout(Duration::from_secs(20), supervision_receiver.recv())
-                .await
-                .expect("timeout")
-                .unwrap();
+            let failure =
+                tokio::time::timeout(Duration::from_secs(20), supervision_receiver.recv())
+                    .await
+                    .expect("timeout")
+                    .unwrap();
             check_failure(failure);
         }
 
@@ -1152,10 +1162,13 @@ mod tests {
         let supervisor = supervision_port.bind();
         let num_replicas = 4;
         let mut hm = testing::host_mesh(num_replicas).await;
-        let proc_mesh = hm.spawn(instance, "test", Extent::unity()).await.unwrap();
+        let proc_mesh = hm
+            .spawn(instance, "test", Extent::unity(), None)
+            .await
+            .unwrap();
         let mut second_hm = testing::host_mesh(num_replicas).await;
         let second_proc_mesh = second_hm
-            .spawn(instance, "test2", Extent::unity())
+            .spawn(instance, "test2", Extent::unity(), None)
             .await
             .unwrap();
         let child_name = Name::new("child").unwrap();
@@ -1218,11 +1231,11 @@ mod tests {
 
         // Wait for a supervision event to occur on these actors.
         for _ in 0..num_replicas {
-            let failure = RealClock
-                .timeout(Duration::from_secs(20), supervision_receiver.recv())
-                .await
-                .expect("timeout")
-                .unwrap();
+            let failure =
+                tokio::time::timeout(Duration::from_secs(20), supervision_receiver.recv())
+                    .await
+                    .expect("timeout")
+                    .unwrap();
             check_failure(failure);
         }
 
@@ -1241,7 +1254,10 @@ mod tests {
         let supervisor = supervision_port.bind();
         let num_replicas = 4;
         let mut hm = testing::host_mesh(num_replicas).await;
-        let proc_mesh = hm.spawn(instance, "test", Extent::unity()).await.unwrap();
+        let proc_mesh = hm
+            .spawn(instance, "test", Extent::unity(), None)
+            .await
+            .unwrap();
         let child_name = Name::new("child").unwrap();
 
         // Need to use a wrapper as there's no way to customize the handler for MeshFailure
@@ -1271,11 +1287,11 @@ mod tests {
             .unwrap();
 
         for _ in 0..sliced_replicas {
-            let supervision_message = RealClock
-                .timeout(Duration::from_secs(20), supervision_receiver.recv())
-                .await
-                .expect("timeout")
-                .unwrap();
+            let supervision_message =
+                tokio::time::timeout(Duration::from_secs(20), supervision_receiver.recv())
+                    .await
+                    .expect("timeout")
+                    .unwrap();
             let event = supervision_message.event;
             assert_eq!(event.actor_id.name(), format!("{}", child_name.clone()));
             if let ActorStatus::Failed(ActorErrorKind::Generic(msg)) = &event.actor_status {
@@ -1298,7 +1314,7 @@ mod tests {
         let instance = testing::instance();
         let mut host_mesh = testing::host_mesh(4).await;
         let proc_mesh = host_mesh
-            .spawn(instance, "test", Extent::unity())
+            .spawn(instance, "test", Extent::unity(), None)
             .await
             .unwrap();
         let actor_mesh: ActorMesh<testactor::TestActor> =
@@ -1348,7 +1364,10 @@ mod tests {
 
         // Create a proc mesh with 2 hosts.
         let mut hm = testing::host_mesh(2).await;
-        let proc_mesh = hm.spawn(instance, "test", Extent::unity()).await.unwrap();
+        let proc_mesh = hm
+            .spawn(instance, "test", Extent::unity(), None)
+            .await
+            .unwrap();
 
         // Set up undeliverable message port for collecting undeliverables
         let (undeliverable_port, mut undeliverable_rx) =
@@ -1397,7 +1416,7 @@ mod tests {
             .unwrap();
 
         // Give it a moment to fully stop
-        RealClock.sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Set message delivery timeout for faster test
         let config = hyperactor_config::global::lock();
@@ -1423,10 +1442,9 @@ mod tests {
         // The fact that we successfully collect them proves the ping actor
         // is still running and handling undeliverables correctly (not crashing).
         let mut count = 0;
-        let deadline = RealClock.now() + std::time::Duration::from_secs(10);
-        while count < n && RealClock.now() < deadline {
-            match RealClock
-                .timeout(std::time::Duration::from_secs(1), undeliverable_rx.recv())
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while count < n && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), undeliverable_rx.recv())
                 .await
             {
                 Ok(Ok(Undeliverable(envelope))) => {
@@ -1471,7 +1489,10 @@ mod tests {
 
         // Create proc mesh with 2 procs
         let mut hm = testing::host_mesh(2).await;
-        let proc_mesh = hm.spawn(instance, "test", Extent::unity()).await.unwrap();
+        let proc_mesh = hm
+            .spawn(instance, "test", Extent::unity(), None)
+            .await
+            .unwrap();
 
         // Spawn SleepActors across the mesh that will block longer
         // than timeout
@@ -1487,16 +1508,16 @@ mod tests {
         }
 
         // Give actors time to start sleeping
-        RealClock.sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Count how many actors we spawned (for verification later)
         let expected_actors = sleep_mesh.values().count();
 
         // Now stop the mesh - actors won't respond in time, should be
         // aborted. Time this operation to verify abort behavior.
-        let stop_start = RealClock.now();
+        let stop_start = tokio::time::Instant::now();
         let result = sleep_mesh.stop(instance, "test stop".to_string()).await;
-        let stop_duration = RealClock.now().duration_since(stop_start);
+        let stop_duration = tokio::time::Instant::now().duration_since(stop_start);
 
         // Stop will return an error because actors didn't stop within
         // the timeout. This is expected - the actors were forcibly
@@ -1554,7 +1575,10 @@ mod tests {
 
         // Create proc mesh with 2 procs
         let mut hm = testing::host_mesh(2).await;
-        let proc_mesh = hm.spawn(instance, "test", Extent::unity()).await.unwrap();
+        let proc_mesh = hm
+            .spawn(instance, "test", Extent::unity(), None)
+            .await
+            .unwrap();
 
         // Spawn TestActors - these stop cleanly (no blocking
         // operations)
@@ -1569,9 +1593,9 @@ mod tests {
         assert!(expected_actors > 0, "Should have spawned some actors");
 
         // Time the stop operation
-        let stop_start = RealClock.now();
+        let stop_start = tokio::time::Instant::now();
         let result = actor_mesh.stop(instance, "test stop".to_string()).await;
-        let stop_duration = RealClock.now().duration_since(stop_start);
+        let stop_duration = tokio::time::Instant::now().duration_since(stop_start);
 
         // Graceful stop should succeed (return Ok)
         assert!(
