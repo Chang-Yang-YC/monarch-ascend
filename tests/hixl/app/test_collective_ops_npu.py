@@ -4,11 +4,18 @@ P0 NPU Test Suite — Collective communication primitives, multi-NPU scale,
 and key upstream GPU test mirrors.
 
 Usage:
-    python test_p0_npu.py --devs 1,2              # 2-card tests
-    python test_p0_npu.py --devs 1,2,3,4          # includes 4-card scale
-    python test_p0_npu.py --devs 1,2 --only collective
-    python test_p0_npu.py --devs 1,2,3,4 --only scale
-    python test_p0_npu.py --devs 1,2 --only mirror
+    python test_collective_ops_npu.py --devs 1,2                 # 2-card tests
+    python test_collective_ops_npu.py --devs 1,2,3,4             # 2+4 card tests
+    python test_collective_ops_npu.py --devs 0,1,2,3,4,5,6,7     # all including 8-card
+    python test_collective_ops_npu.py --devs 0,1,2,3,4,5,6,7 --only scale8
+    python test_collective_ops_npu.py --devs 1,2 --only collective
+    python test_collective_ops_npu.py --devs 1,2 --only mirror
+
+Test groups:
+    collective  — 2-card collective primitives (allreduce, allgather, etc.)
+    scale       — 4-card scale-up tests
+    scale8      — 8-card full-scale tests
+    mirror      — upstream GPU test mirrors (2 cards)
 
 Known HCCL limitations on Ascend 910B / CANN 9.0:
   - reduce("avg") hangs (ReduceOp.AVG not supported by HCCL)
@@ -333,6 +340,175 @@ async def test_multi_npu_scale(devs: list):
 
 
 # ===================================================================
+# P0-2b: Full-scale 8-NPU Tests
+# ===================================================================
+
+async def test_8npu_scale(devs: list):
+    assert len(devs) >= 8
+    dev_str = ",".join(str(d) for d in devs[:8])
+    _header(f"P0-2b: 8-NPU Full Scale ({dev_str})")
+
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = dev_str
+    mesh = this_host().spawn_procs(per_host={"npus": 8})
+
+    # --- 8-card allreduce(sum) ---
+    try:
+        with mesh.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            x = torch.ones(4, 4, device="npu") * (rank + 1)
+            y = x.reduce("npus", "sum")
+            val = monarch.inspect(y)
+        expected_sum = sum(range(1, 9))  # 1+2+...+8 = 36
+        expected = torch.ones(4, 4) * expected_sum
+        assert torch.allclose(val, expected), f"got {val.flatten()[0]}"
+        _pass("8npu_allreduce(sum)", f"1+2+...+8={val.flatten()[0].item()}")
+    except Exception as e:
+        _fail("8npu_allreduce(sum)", e)
+
+    # --- 8-card allreduce(max) ---
+    try:
+        with mesh.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            x = torch.ones(4, device="npu") * (rank + 1)
+            y = x.reduce("npus", "max")
+            val = monarch.inspect(y)
+        assert torch.allclose(val, torch.ones(4) * 8.0), f"Expected 8, got {val}"
+        _pass("8npu_allreduce(max)", f"max={val[0].item()}")
+    except Exception as e:
+        _fail("8npu_allreduce(max)", e)
+
+    # --- 8-card allreduce(min) ---
+    try:
+        with mesh.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            x = torch.ones(4, device="npu") * (rank + 1)
+            y = x.reduce("npus", "min")
+            val = monarch.inspect(y)
+        assert torch.allclose(val, torch.ones(4) * 1.0), f"Expected 1, got {val}"
+        _pass("8npu_allreduce(min)", f"min={val[0].item()}")
+    except Exception as e:
+        _fail("8npu_allreduce(min)", e)
+
+    # --- 8-card allgather(stack) ---
+    try:
+        with mesh.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            x = torch.ones(4, device="npu") * (rank + 1)
+            g = x.reduce("npus", "stack")
+            val = monarch.inspect(g)
+        assert val.shape == (8, 4), f"shape {val.shape}"
+        for i in range(8):
+            assert torch.allclose(val[i], torch.ones(4) * (i + 1)), f"r{i}: {val[i]}"
+        _pass("8npu_allgather(stack)", f"shape={val.shape}")
+    except Exception as e:
+        _fail("8npu_allgather(stack)", e)
+
+    # --- 8-card reduce_scatter(sum) ---
+    try:
+        with mesh.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            x = torch.ones(8, 4, device="npu") * (rank + 1)
+            rs = x.reduce("npus", "sum", scatter=True)
+            vals = [monarch.inspect(rs, npus=i) for i in range(8)]
+        expected_val = float(sum(range(1, 9)))  # 36.0
+        for i, v in enumerate(vals):
+            assert torch.allclose(v, torch.ones_like(v) * expected_val), f"r{i}: {v}"
+        _pass("8npu_reduce_scatter(sum)", f"shard={vals[0].shape}, val={expected_val}")
+    except Exception as e:
+        _fail("8npu_reduce_scatter(sum)", e)
+
+    # --- 8-card broadcast (npu0 → all) ---
+    try:
+        npu0 = mesh.slice(npus=0)
+        with npu0.activate():
+            src = torch.tensor([10.0, 20.0, 30.0, 40.0], device="npu")
+            bcast = src.to_mesh(mesh)
+        with mesh.activate():
+            gathered = bcast.reduce("npus", "stack")
+            val = monarch.inspect(gathered)
+        assert val.shape == (8, 4), f"shape {val.shape}"
+        for i in range(8):
+            assert torch.allclose(val[i], torch.tensor([10.0, 20.0, 30.0, 40.0])), f"r{i}"
+        _pass("8npu_broadcast", "[10,20,30,40]→all 8")
+    except Exception as e:
+        _fail("8npu_broadcast", e)
+
+    # --- 8-card to_mesh: npu0 → npu7 (max hop) ---
+    try:
+        npu0 = mesh.slice(npus=0)
+        npu7 = mesh.slice(npus=7)
+        with npu0.activate():
+            data = torch.tensor([1.0, 2.0, 3.0, 4.0], device="npu")
+            sent = data.to_mesh(npu7)
+        with npu7.activate():
+            val = monarch.inspect(sent)
+        assert torch.allclose(val, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        _pass("8npu_to_mesh(0→7)", f"{val.tolist()}")
+    except Exception as e:
+        _fail("8npu_to_mesh(0→7)", e)
+
+    # --- 8-card to_mesh: npu3 → npu5 (middle hop) ---
+    try:
+        npu3 = mesh.slice(npus=3)
+        npu5 = mesh.slice(npus=5)
+        with npu3.activate():
+            data = torch.tensor([50.0, 60.0], device="npu")
+            sent = data.to_mesh(npu5)
+        with npu5.activate():
+            val = monarch.inspect(sent)
+        assert torch.allclose(val, torch.tensor([50.0, 60.0]))
+        _pass("8npu_to_mesh(3→5)", f"{val.tolist()}")
+    except Exception as e:
+        _fail("8npu_to_mesh(3→5)", e)
+
+    # --- 8-card rank_tensor ---
+    try:
+        with mesh.activate():
+            f = 10 * mesh.rank_tensor("npus").npu()
+            vals = [monarch.inspect(f, npus=i) for i in range(8)]
+        for i, v in enumerate(vals):
+            assert v == i * 10, f"r{i}: {v}"
+        _pass("8npu_rank_tensor", f"{vals}")
+    except Exception as e:
+        _fail("8npu_rank_tensor", e)
+
+    # --- 8-card large tensor allreduce ---
+    try:
+        with mesh.activate():
+            big = torch.ones(512, 512, device="npu")
+            reduced = big.reduce("npus", "sum")
+            val = monarch.inspect(reduced)
+        expected = torch.ones(512, 512) * 8.0
+        assert torch.allclose(val, expected), f"max diff={torch.max(torch.abs(val - expected))}"
+        mb = big.numel() * 4 / 1024 / 1024
+        _pass("8npu_large_allreduce", f"512x512 ({mb:.1f} MB) sum=8.0")
+    except Exception as e:
+        _fail("8npu_large_allreduce", e)
+
+    # --- 8-card sub-mesh: half-mesh reduce ---
+    try:
+        half_a = mesh.slice(npus=slice(0, 4))
+        half_b = mesh.slice(npus=slice(4, 8))
+        with half_a.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            x = torch.ones(4, device="npu") * (rank + 1)
+            y = x.reduce("npus", "sum")
+            val_a = monarch.inspect(y)
+        with half_b.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            x = torch.ones(4, device="npu") * (rank + 1)
+            y = x.reduce("npus", "sum")
+            val_b = monarch.inspect(y)
+        expected_a = float(1 + 2 + 3 + 4)
+        expected_b = float(5 + 6 + 7 + 8)
+        assert torch.allclose(val_a, torch.ones(4) * expected_a), f"half_a: {val_a}"
+        assert torch.allclose(val_b, torch.ones(4) * expected_b), f"half_b: {val_b}"
+        _pass("8npu_sub_mesh_reduce", f"half_a={expected_a}, half_b={expected_b}")
+    except Exception as e:
+        _fail("8npu_sub_mesh_reduce", e)
+
+
+# ===================================================================
 # P0-3: Upstream GPU Test Mirrors (2 NPUs)
 # ===================================================================
 
@@ -462,6 +638,7 @@ async def run_tests(devs: list, only: str = None):
     groups = {
         "collective": (test_collective_ops, 2),
         "scale": (test_multi_npu_scale, 4),
+        "scale8": (test_8npu_scale, 8),
         "mirror": (test_mirror_gpu, 2),
     }
     to_run = [only] if only else list(groups.keys())
@@ -478,7 +655,7 @@ async def main():
     parser.add_argument("--devs", type=str, default=None,
                         help="Comma-separated NPU device IDs")
     parser.add_argument("--only", type=str, default=None,
-                        choices=["collective", "scale", "mirror"])
+                        choices=["collective", "scale", "scale8", "mirror"])
     args = parser.parse_args()
 
     if args.devs:
