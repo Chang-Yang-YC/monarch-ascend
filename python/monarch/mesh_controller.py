@@ -268,9 +268,15 @@ def _initialize_env(worker_point: Point, proc_id: str) -> None:
             local_rank = worker_rank % gpus_per_host
 
         num_worker_procs = worker_point.extent.nelements
+        parent_ascend = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+        if parent_ascend:
+            ascend_devs = [d.strip() for d in parent_ascend.split(",") if d.strip()]
+            ascend_vis = ascend_devs[local_rank] if local_rank < len(ascend_devs) else str(local_rank)
+        else:
+            ascend_vis = str(local_rank)
         process_env = {
             "CUDA_VISIBLE_DEVICES": str(local_rank),
-            "ASCEND_RT_VISIBLE_DEVICES": str(local_rank),
+            "ASCEND_RT_VISIBLE_DEVICES": ascend_vis,
             "NCCL_HOSTID": f"{proc_id}_host_{worker_rank // gpus_per_host}",
             # This is needed to avoid a hard failure in ncclx when we do not
             # have backend topology info (eg. on RE).
@@ -289,9 +295,6 @@ def _initialize_env(worker_point: Point, proc_id: str) -> None:
             try:
                 import torch_npu  # noqa: F401
                 if hasattr(torch, "npu") and torch.npu.is_available():
-                    # ASCEND_RT_VISIBLE_DEVICES is already set to local_rank,
-                    # so the process only sees 1 NPU as logical device 0.
-                    # Analogous to torch.cuda.init() which defaults to device 0.
                     torch.npu.set_device(0)
             except ImportError:
                 pass

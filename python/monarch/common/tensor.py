@@ -677,7 +677,7 @@ class InputChecker:
 
     def check_cuda(self):
         for t in self.tensors:
-            if not t.is_cuda:
+            if not (t.is_cuda or getattr(t, "is_npu", False)):
                 self.errors[t].append(explain["CROSS_DEVICE_REQUIRES_CUDA"])
 
     def __enter__(self) -> "InputChecker":

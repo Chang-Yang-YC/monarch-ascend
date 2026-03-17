@@ -93,6 +93,26 @@ typedef struct HcclSendRecvItemDef {
     uint32_t remoteRank;
 } HcclSendRecvItem;
 
+// HcclCommConfig - mirrors the official HCCL struct for sub-comm creation
+typedef struct HcclCommConfigDef {
+    char reserved[24];                 // Contains size, magicWord, version
+    uint32_t hcclBufferSize;
+    uint32_t hcclDeterministic;
+    char hcclCommName[128];
+    char hcclUdi[128];
+    uint32_t hcclOpExpansionMode;
+    uint32_t hcclRdmaTrafficClass;
+    uint32_t hcclRdmaServiceLevel;
+    uint32_t hcclWorldRankID;
+    uint64_t hcclJobID;
+    uint8_t aclGraphZeroCopyEnable;
+    int32_t hcclExecTimeOut;
+    char hcclAlgo[1600];
+    char hcclRetryEnable[50];
+    char hcclRetryParams[128];
+    char hcclBufferName[128];
+} HcclCommConfig;
+
 #define HCCL_ROOT_INFO_BYTES 4108
 
 typedef struct HcclRootInfoDef {

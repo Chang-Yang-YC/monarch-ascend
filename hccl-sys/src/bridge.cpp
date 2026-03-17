@@ -9,6 +9,32 @@
 #include "bridge.h"
 #include <dlfcn.h>
 #include <iostream>
+#include <cstring>
+
+// Mirrors HcclCommConfig from hccl_types.h with proper initialization
+// from HcclCommConfigInit in hccl_comm.h.
+static void bridge_init_hccl_comm_config(HcclCommConfig *config) {
+  if (!config) return;
+  memset(config, 0, sizeof(HcclCommConfig));
+  // The reserved[24] field contains: size(8) + magicWord(4) + version(4) + reserved(8)
+  struct ConfigHeader {
+    size_t size;
+    uint32_t magicWord;
+    uint32_t version;
+    uint64_t reserved;
+  };
+  auto *hdr = reinterpret_cast<ConfigHeader *>(config->reserved);
+  hdr->size = sizeof(HcclCommConfig);
+  hdr->magicWord = 0xf0f0f0f0;  // HCCL_COMM_CONFIG_MAGIC_WORD
+  hdr->version = 9;              // HCCL_COMM_CONFIG_VERSION
+  hdr->reserved = 0;
+  config->hcclBufferSize = 0xffffffff;      // NOT_SET
+  config->hcclDeterministic = 0xffffffff;   // NOT_SET
+  config->hcclOpExpansionMode = 0;          // default
+  config->hcclRdmaTrafficClass = 0xffffffff; // NOT_SET
+  config->hcclRdmaServiceLevel = 0xffffffff; // NOT_SET
+  config->hcclExecTimeOut = static_cast<int32_t>(0xffffffff); // NOT_SET
+}
 
 namespace hccl_sys {
 
@@ -236,8 +262,16 @@ HcclResult HcclCreateSubCommConfig(HcclComm *comm, uint32_t rankNum,
                                    uint32_t subCommRankId, void *config,
                                    HcclComm *subComm) {
   GET_HCCL_API(api);
+  HcclCommConfig default_config;
+  void *actual_config;
+  if (config) {
+    actual_config = config;
+  } else {
+    bridge_init_hccl_comm_config(&default_config);
+    actual_config = &default_config;
+  }
   return api->HcclCreateSubCommConfig_(comm, rankNum, rankIds, subCommId,
-                                       subCommRankId, config, subComm);
+                                       subCommRankId, actual_config, subComm);
 }
 
 HcclResult HcclAllReduce(void *sendBuf, void *recvBuf, uint64_t count,

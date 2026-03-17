@@ -269,6 +269,7 @@ pub struct Communicator {
     global_world_size: i32,
     global_rank: i32,
     device: NpuDevice,
+    split_counter: u64,
 }
 
 unsafe impl Send for Communicator {}
@@ -298,6 +299,7 @@ impl Communicator {
             global_rank: rank,
             global_world_size: world_size,
             device,
+            split_counter: 0,
         })
     }
 
@@ -346,7 +348,9 @@ impl Communicator {
 
         let group_rank = ranks.iter().position(|v| *v == self.rank).unwrap() as u32;
         let mut rank_ids: Vec<u32> = ranks.iter().map(|r| *r as u32).collect();
-        let sub_comm_id = calculate_color(&ranks) as u64;
+        self.split_counter += 1;
+        let base_color = calculate_color(&ranks) as u64;
+        let sub_comm_id = base_color.wrapping_mul(1000).wrapping_add(self.split_counter);
         let mut sub_comm: HcclComm = std::ptr::null_mut();
 
         unsafe {
@@ -368,6 +372,7 @@ impl Communicator {
             global_rank: self.global_rank,
             global_world_size: self.global_world_size,
             device: self.device,
+            split_counter: 0,
         }))
     }
 
