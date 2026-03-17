@@ -629,6 +629,134 @@ async def test_mirror_gpu(devs: list):
     except Exception as e:
         _fail("large_tensor_to_mesh", e)
 
+    # --- mirror: test_sub_mesh (controller.py) ---
+    try:
+        npu0 = mesh.slice(npus=0)
+        npu1 = mesh.slice(npus=1)
+        with npu0.activate():
+            _ = torch.rand(3, 4, device="npu")
+        with npu1.activate():
+            _ = torch.rand(3, 4, device="npu")
+        _pass("mirror_sub_mesh", "activate on different slices")
+    except Exception as e:
+        _fail("mirror_sub_mesh", e)
+
+    # --- mirror: test_movement (controller.py) ---
+    try:
+        npu0 = mesh.slice(npus=0)
+        npu1 = mesh.slice(npus=1)
+        with npu0.activate():
+            x = torch.rand(3, 4, device="npu")
+            _ = x.to_mesh(npu1)
+        with mesh.activate():
+            a = torch.rand(3, 4, device="npu")
+        a_sliced = a.slice_mesh(npus=0)
+        _ = a_sliced.to_mesh(npu0)
+        _ = a_sliced.to_mesh(npu1)
+        _pass("mirror_movement", "to_mesh + slice_mesh→to_mesh")
+    except Exception as e:
+        _fail("mirror_movement", e)
+
+    # --- mirror: test_to_mesh_cow (controller.py) ---
+    try:
+        with mesh.activate():
+            t = torch.zeros((), device="npu")
+            t2 = t.to_mesh(mesh)
+            t.add_(1)
+            val_t2 = monarch.inspect(t2)
+            val_t = monarch.inspect(t)
+        assert val_t2.item() == 0, f"cow: t2 should be 0, got {val_t2.item()}"
+        assert val_t.item() == 1, f"cow: t should be 1, got {val_t.item()}"
+        _pass("mirror_to_mesh_cow", "copy-on-write: t2=0, t=1")
+    except Exception as e:
+        _fail("mirror_to_mesh_cow", e)
+
+    # --- mirror: test_to_mesh_pytree (controller.py) ---
+    try:
+        npu0 = mesh.slice(npus=0)
+        npu1 = mesh.slice(npus=1)
+        with npu0.activate():
+            a = torch.zeros((1,), device="npu")
+            b = torch.ones((1,), device="npu")
+            tensor_dict = {"a": a, "b": b}
+            moved = monarch.to_mesh(tensor_dict, npu1)
+        with npu1.activate():
+            moved["a"].add_(1)
+            moved["b"].add_(1)
+        moved_a = monarch.inspect(moved["a"])
+        moved_b = monarch.inspect(moved["b"])
+        assert torch.equal(moved_a, torch.tensor([1.0])), f"a: {moved_a}"
+        assert torch.equal(moved_b, torch.tensor([2.0])), f"b: {moved_b}"
+        _pass("mirror_to_mesh_pytree", f"a={moved_a.item()}, b={moved_b.item()}")
+    except Exception as e:
+        _fail("mirror_to_mesh_pytree", e)
+
+    # --- mirror: test_slice_mesh_pytree (controller.py, adapted to 1D) ---
+    try:
+        with mesh.activate():
+            rank = mesh.rank_tensor("npus").npu()
+            a = rank + torch.zeros((1,), device="npu")
+            b = rank + torch.ones((1,), device="npu")
+        tensor_dict = {"a": a, "b": b}
+        npu0 = mesh.slice(npus=0)
+        npu1 = mesh.slice(npus=1)
+        npu0_slices = monarch.slice_mesh(tensor_dict, npus=0)
+        npu1_slices = monarch.slice_mesh(tensor_dict, npus=1)
+        npu0_tensors = monarch.to_mesh(npu0_slices, npu0)
+        npu1_tensors = monarch.to_mesh(npu1_slices, npu1)
+        with npu0.activate():
+            a0 = monarch.inspect(npu0_tensors["a"])
+            b0 = monarch.inspect(npu0_tensors["b"])
+        with npu1.activate():
+            a1 = monarch.inspect(npu1_tensors["a"])
+            b1 = monarch.inspect(npu1_tensors["b"])
+        assert torch.equal(a0, torch.tensor([0.0])), f"a0: {a0}"
+        assert torch.equal(b0, torch.tensor([1.0])), f"b0: {b0}"
+        assert torch.equal(a1, torch.tensor([1.0])), f"a1: {a1}"
+        assert torch.equal(b1, torch.tensor([2.0])), f"b1: {b1}"
+        _pass("mirror_slice_mesh_pytree", f"a0=0,b0=1,a1=1,b1=2")
+    except Exception as e:
+        _fail("mirror_slice_mesh_pytree", e)
+
+    # --- mirror: test_many (controller.py) — stress test ---
+    try:
+        with mesh.activate():
+            x = torch.rand(3, 4, device="npu")
+            for _ in range(512):
+                x = x + torch.rand(3, 4, device="npu")
+            val = monarch.inspect(x)
+        assert val.shape == (3, 4), f"shape: {val.shape}"
+        _pass("mirror_many_ops", f"512 sequential adds, shape={val.shape}")
+    except Exception as e:
+        _fail("mirror_many_ops", e)
+
+    # --- mirror: test_torch_tensor (controller.py) ---
+    try:
+        with mesh.activate():
+            t_cpu = torch.tensor([1, 2, 4])
+            t_npu = torch.tensor([1, 2, 4], device="npu")
+            val_cpu = monarch.inspect(t_cpu)
+            val_npu = monarch.inspect(t_npu)
+        assert torch.allclose(val_cpu, torch.tensor([1, 2, 4])), f"cpu: {val_cpu}"
+        assert torch.allclose(val_npu, torch.tensor([1, 2, 4])), f"npu: {val_npu}"
+        _pass("mirror_torch_tensor", "cpu+npu tensor creation")
+    except Exception as e:
+        _fail("mirror_torch_tensor", e)
+
+    # --- mirror: test_torch_op_with_optional_tensors (controller.py) ---
+    try:
+        with mesh.activate():
+            x = torch.rand(3, 4, device="npu")
+            ln_with = torch.nn.LayerNorm(4, device="npu", bias=True, elementwise_affine=True)
+            ln_none = torch.nn.LayerNorm(4, device="npu", bias=False, elementwise_affine=False)
+            val1 = monarch.inspect(ln_with(x))
+            val2 = monarch.inspect(ln_none(x))
+        assert val1.shape == (3, 4), f"with: {val1.shape}"
+        assert val2.shape == (3, 4), f"none: {val2.shape}"
+        _pass("mirror_layernorm_optional", f"bias=T/F both ok")
+    except Exception as e:
+        _fail("mirror_layernorm_optional", e)
+
 
 # ===================================================================
 # Main
