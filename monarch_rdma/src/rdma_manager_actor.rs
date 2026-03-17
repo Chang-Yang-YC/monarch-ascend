@@ -125,7 +125,7 @@ wirevalue::register_type!(ReleaseBuffer);
 pub struct EnsurePeerConnected {
     pub peer_engine_id: String,
     #[reply]
-    pub reply: OncePortRef<()>,
+    pub reply: reference::OncePortRef<()>,
 }
 #[cfg(feature = "hixl")]
 wirevalue::register_type!(EnsurePeerConnected);

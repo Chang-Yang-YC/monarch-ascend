@@ -22,13 +22,9 @@ use std::sync::RwLock;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Returns `true` when `addr` is a CUDA device pointer.
-///
-/// Probes the CUDA driver via `cuPointerGetAttribute`; returns `false`
-/// when CUDA is unavailable or the pointer is not device memory.
+/// Returns `true` when `addr` is a device pointer (CUDA or NPU).
+#[cfg(not(feature = "hixl"))]
 pub fn is_device_ptr(addr: usize) -> bool {
-    // SAFETY: FFI call that queries pointer metadata without accessing
-    // the pointed-to memory.
     unsafe {
         let mut mem_type: u32 = 0;
         let err = rdmaxcel_sys::rdmaxcel_cuPointerGetAttribute(
@@ -38,6 +34,14 @@ pub fn is_device_ptr(addr: usize) -> bool {
         );
         err == rdmaxcel_sys::CUDA_SUCCESS && mem_type == rdmaxcel_sys::CU_MEMORYTYPE_DEVICE
     }
+}
+
+/// On NPU (HiXL), we cannot probe device pointers via CUDA APIs. Assume
+/// host memory — actual device-memory transfers go through the HiXL engine
+/// which handles device addressing internally.
+#[cfg(feature = "hixl")]
+pub fn is_device_ptr(_addr: usize) -> bool {
+    false
 }
 
 /// Handle to a contiguous region of local memory.
@@ -91,12 +95,7 @@ unsafe fn write_cpu(addr: usize, offset: usize, src: &[u8]) {
     }
 }
 
-/// Copy `dst.len()` bytes from device memory at `addr + offset` into `dst`.
-///
-/// # Safety
-///
-/// The caller must ensure that `addr` is a valid CUDA device pointer to an
-/// allocation of at least `offset + dst.len()` bytes.
+#[cfg(not(feature = "hixl"))]
 unsafe fn read_gpu(addr: usize, offset: usize, dst: &mut [u8]) -> Result<(), anyhow::Error> {
     let rc = unsafe {
         rdmaxcel_sys::rdmaxcel_cuMemcpyDtoH_v2(
@@ -112,12 +111,7 @@ unsafe fn read_gpu(addr: usize, offset: usize, dst: &mut [u8]) -> Result<(), any
     Ok(())
 }
 
-/// Copy `src.len()` bytes from `src` into device memory at `addr + offset`.
-///
-/// # Safety
-///
-/// The caller must ensure that `addr` is a valid CUDA device pointer to an
-/// allocation of at least `offset + src.len()` bytes.
+#[cfg(not(feature = "hixl"))]
 unsafe fn write_gpu(addr: usize, offset: usize, src: &[u8]) -> Result<(), anyhow::Error> {
     let rc = unsafe {
         rdmaxcel_sys::rdmaxcel_cuMemcpyHtoD_v2(
@@ -131,6 +125,16 @@ unsafe fn write_gpu(addr: usize, offset: usize, src: &[u8]) -> Result<(), anyhow
         "cuMemcpyHtoD failed with error code {rc}"
     );
     Ok(())
+}
+
+#[cfg(feature = "hixl")]
+unsafe fn read_gpu(_addr: usize, _offset: usize, _dst: &mut [u8]) -> Result<(), anyhow::Error> {
+    anyhow::bail!("GPU memory read not supported on NPU/HiXL builds")
+}
+
+#[cfg(feature = "hixl")]
+unsafe fn write_gpu(_addr: usize, _offset: usize, _src: &[u8]) -> Result<(), anyhow::Error> {
+    anyhow::bail!("GPU memory write not supported on NPU/HiXL builds")
 }
 
 /// Marker trait: the implementor keeps a backing memory allocation alive.

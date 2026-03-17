@@ -13,6 +13,7 @@
 
 #[cfg(not(feature = "hixl"))]
 pub mod ibverbs;
+#[cfg(not(feature = "hixl"))]
 pub mod tcp;
 
 #[cfg(feature = "hixl")]

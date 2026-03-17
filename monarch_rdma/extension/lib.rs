@@ -19,11 +19,9 @@ use monarch_hyperactor::runtime::signal_safe_block_on;
 use monarch_rdma::RdmaManagerActor;
 use monarch_rdma::RdmaManagerMessageClient;
 use monarch_rdma::RdmaRemoteBuffer;
-use monarch_rdma::ibverbs_supported;
 use monarch_rdma::local_memory::Keepalive;
 use monarch_rdma::local_memory::KeepaliveLocalMemory;
 use monarch_rdma::local_memory::RdmaLocalMemory;
-use monarch_rdma::rdma_supported;
 use monarch_rdma::register_segment_scanner;
 use monarch_types::py_module_add_function;
 use pyo3::IntoPyObjectExt;
@@ -38,6 +36,8 @@ use typeuri::Named;
 
 // ---- GPU: ibverbs-specific imports and functions ----
 
+#[cfg(not(feature = "hixl"))]
+use monarch_rdma::ibverbs_supported;
 #[cfg(not(feature = "hixl"))]
 use monarch_rdma::rdma_supported;
 
@@ -286,7 +286,7 @@ impl PyRdmaBuffer {
         for ctx in &self.buffer.backends {
             match ctx {
                 #[cfg(feature = "hixl")]
-                monarch_rdma::backend::RdmaBackendContext::Hixl(buf) => {
+                monarch_rdma::backend::RdmaRemoteBackendContext::Hixl(buf) => {
                     return Some((buf.engine_id.clone(), buf.addr));
                 }
                 #[allow(unreachable_patterns)]
@@ -400,17 +400,33 @@ impl PyRdmaManager {
 }
 
 /// Whether ibverbs RDMA hardware is available on this system.
+#[cfg(not(feature = "hixl"))]
 #[pyfunction]
 #[pyo3(name = "is_ibverbs_available")]
 fn is_ibverbs_available_py() -> bool {
     ibverbs_supported()
 }
 
+#[cfg(feature = "hixl")]
+#[pyfunction]
+#[pyo3(name = "is_ibverbs_available")]
+fn is_ibverbs_available_py() -> bool {
+    false
+}
+
 /// Whether any RDMA backend (ibverbs or TCP fallback) is available.
+#[cfg(not(feature = "hixl"))]
 #[pyfunction]
 #[pyo3(name = "rdma_supported")]
 fn rdma_supported_py() -> bool {
     rdma_supported()
+}
+
+#[cfg(feature = "hixl")]
+#[pyfunction]
+#[pyo3(name = "rdma_supported")]
+fn rdma_supported_py() -> bool {
+    is_rdma_supported()
 }
 
 pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
