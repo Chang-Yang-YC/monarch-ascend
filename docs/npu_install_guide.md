@@ -151,7 +151,7 @@ export ASCEND_HOME=/root/hzz/cann-9.0.0-beta.1/aarch64-linux
 #### 方式一：pip install（推荐）
 
 ```bash
-USE_ASCEND_ENGINE=1 pip install -e .
+USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e .
 ```
 
 #### 方式二：仅编译 Rust 后端
