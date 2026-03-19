@@ -22,7 +22,6 @@ import torch
 import torch_npu  # noqa: F401
 from monarch.actor import Actor, endpoint, this_host
 from monarch._src.rdma.xdma import XDMABuffer
-from monarch._src.rdma.transport import get_transport
 
 
 def npu_device(dev_id: int):
@@ -56,16 +55,6 @@ class Producer(Actor):
         )
         return buf
 
-    @endpoint
-    async def connect_to_peer(self, peer_engine_id: str) -> str:
-        try:
-            be = get_transport()
-            if be is not None:
-                be.ensure_peer_connected(peer_engine_id)
-                return f"CONNECTED_TO {peer_engine_id}"
-            return "NO_BACKEND"
-        except Exception as e:
-            return f"CONNECT_FAIL: {e}"
 
 
 class Consumer(Actor):
@@ -75,18 +64,11 @@ class Consumer(Actor):
               flush=True)
 
     @endpoint
-    async def get_engine_id(self) -> str:
-        be = get_transport()
-        if be is None:
-            return "NO_BACKEND"
-        return be.get_engine_id()
-
-    @endpoint
     async def read_from(self, buf: XDMABuffer) -> str:
         dst = torch.zeros(1024, dtype=torch.float32, device="npu")
         torch.npu.synchronize()
         try:
-            buf.read_into(dst).get(timeout=30)
+            await buf.read_into(dst, timeout=30)
             torch.npu.synchronize()
             vals = dst[:4].cpu().tolist()
             return f"READ_OK vals={vals}"
@@ -101,7 +83,7 @@ class Consumer(Actor):
         src.fill_(value)
         torch.npu.synchronize()
         try:
-            buf.write_from(src).get(timeout=30)
+            await buf.write_from(src, timeout=30)
             return "WRITE_OK"
         except Exception as e:
             import traceback
@@ -113,7 +95,7 @@ class Consumer(Actor):
         dst = torch.zeros(1024, dtype=torch.float32, device="npu")
         torch.npu.synchronize()
         try:
-            buf.read_into(dst).get(timeout=30)
+            await buf.read_into(dst, timeout=30)
             torch.npu.synchronize()
             val = dst[0].item()
             if abs(val - expected) < 0.01:
@@ -140,13 +122,8 @@ async def run_tests():
     # Create a single shared buffer for all tests.
     # HCCS requires aligned addresses — using a single buffer avoids
     # alignment issues with the NPU memory allocator for subsequent allocs.
-    print("\n--- Setup: Create buffer + bidirectional connect ---")
+    print("\n--- Setup: Create buffer ---")
     buf = await producer.create_buffer.call_one(42.0)
-
-    consumer_eid = await consumer.get_engine_id.call_one()
-    print(f"  Consumer engine_id: {consumer_eid}")
-    connect_result = await producer.connect_to_peer.call_one(consumer_eid)
-    print(f"  Producer connect_to_peer: {connect_result}")
 
     # Test 1: READ — Consumer reads 42.0 from Producer
     print("\n--- Test 1: read_into (expect 42.0) ---")

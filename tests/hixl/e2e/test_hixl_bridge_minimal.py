@@ -67,7 +67,9 @@ class Consumer(Actor):
     @endpoint
     async def pull(self, remote: RDMABuffer) -> float:
         local = torch.zeros(4, 4, dtype=torch.float32, device="npu")
+        torch.npu.synchronize()
         await remote.read_into(local.view(torch.uint8).flatten(), timeout=20)
+        torch.npu.synchronize()
         return local.sum().cpu().item()
 
 
