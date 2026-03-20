@@ -10,8 +10,8 @@
 | NPU | Ascend 910B1 × 8 | 每卡 64GB HBM |
 | CANN | 9.0.0-beta.1 | 自定义路径 `/root/hzz/cann-9.0.0-beta.1/` |
 | Python | 3.11.0 | conda 环境 `monarch_ascend` |
-| PyTorch | 2.7.1+cpu | torch_npu 提供 NPU 后端 |
-| torch_npu | 2.7.1 | 与 CANN 9.0 配套 |
+| PyTorch | 2.9.0 | torch_npu 提供 NPU 后端 |
+| torch_npu | 2.9.0 | 与 CANN 9.0 配套 |
 | Rust | 1.93.0-nightly | 需要 nightly（`-Zthreads`、`tracing_unstable`）|
 | clang | 12.0.1 | bindgen 需要 |
 | protobuf | 3.14.0 | protoc 编译器 |
@@ -67,8 +67,8 @@ conda activate monarch_ascend
 ### Step 3: 安装 PyTorch + torch_npu
 
 ```bash
-pip install torch==2.7.1
-pip install torch_npu==2.7.1
+pip install torch==2.9.0
+pip install torch_npu==2.9.0
 ```
 
 验证：
@@ -86,9 +86,11 @@ print('NPU count:', torch.npu.device_count())
 
 > **⚠️ 坑 2: torch 和 torch_npu 版本必须严格匹配**
 >
-> torch 2.7.1 只能配 torch_npu 2.7.1。版本不匹配会导致
+> torch 2.9.0 只能配 torch_npu 2.9.0。版本不匹配会导致
 > `RuntimeError: torch_npu is not compatible with the installed torch version`。
 > torch_npu 还要与 CANN 版本配套，具体对应关系见华为文档。
+>
+> **注意**：升级 torch 版本后必须重新编译 Monarch（Rust 扩展链接 libtorch ABI）。
 
 ### Step 4: 安装系统依赖
 
@@ -253,6 +255,20 @@ mesh_a = this_host().spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(0))
 mesh_b = this_host().spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
 ```
 
+### HiXL DMA 与 torch.npu.synchronize()
+
+torch 2.9 的 NPU 内存操作更加异步。在使用 HiXL DMA 传输前后必须调用
+`torch.npu.synchronize()`，否则会出现竞态（例如 `torch.zeros()` 的零填充
+kernel 覆盖 DMA 写入的数据，导致 `read_into` 返回全零）：
+
+```python
+local = torch.zeros(4, 4, dtype=torch.float32, device="npu")
+torch.npu.synchronize()   # 确保零填充完成，页面已分配
+await remote.read_into(local.view(torch.uint8).flatten(), timeout=20)
+torch.npu.synchronize()   # 确保 DMA 数据对后续操作可见
+result = local.sum().cpu().item()
+```
+
 ### HCCS 2MB 内存对齐
 
 默认传输模式 HCCS 要求所有 RDMA buffer 地址 2MB 对齐：
@@ -330,3 +346,5 @@ python tests/hixl/bench_hixl_bandwidth.py 5 6
 | 6 | `libascendcl.so: cannot open` | 没 source CANN 环境 | `source /path/to/cann/set_env.sh` |
 | 7 | `_GLIBCXX_USE_CXX11_ABI` 链接错误 | C++ ABI 不匹配 | pip install 会自动处理；手动编译需加 `CXXFLAGS` |
 | 8 | pip install 编了 GPU 版本 | 环境有 CUDA，优先选了 tensor_engine | 显式 `USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e .` |
+| 9 | `read_into` 返回全零 | torch 2.9 异步零填充与 HiXL DMA 竞态 | `read_into` 前后都加 `torch.npu.synchronize()` |
+| 10 | 升级 torch 后 `import monarch` 崩溃 | Rust 扩展链接了旧 libtorch ABI | 重新 `USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e .` |
