@@ -116,6 +116,20 @@ HixlStatus HixlTransferSync(HixlHandle handle,
                              size_t num_descs,
                              int32_t timeout_ms);
 
+HixlStatus HixlTransferWrite(HixlHandle handle,
+                              const char *remote_engine,
+                              uintptr_t local_addr,
+                              uintptr_t remote_addr,
+                              size_t len,
+                              int32_t timeout_ms);
+
+HixlStatus HixlTransferRead(HixlHandle handle,
+                             const char *remote_engine,
+                             uintptr_t local_addr,
+                             uintptr_t remote_addr,
+                             size_t len,
+                             int32_t timeout_ms);
+
 HixlStatus HixlTransferAsync(HixlHandle handle,
                               const char *remote_engine,
                               HixlTransferOp operation,

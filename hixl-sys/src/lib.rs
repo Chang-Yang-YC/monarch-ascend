@@ -238,6 +238,52 @@ impl Hixl {
         check_status(status)
     }
 
+    /// Synchronous single WRITE transfer.
+    pub fn transfer_write(
+        &self,
+        remote_engine: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> HixlResult<()> {
+        let engine_c = CString::new(remote_engine).unwrap();
+        let status = unsafe {
+            HixlTransferWrite(
+                self.handle,
+                engine_c.as_ptr(),
+                local_addr,
+                remote_addr,
+                len,
+                timeout_ms,
+            )
+        };
+        check_status(status)
+    }
+
+    /// Synchronous single READ transfer.
+    pub fn transfer_read(
+        &self,
+        remote_engine: &str,
+        local_addr: usize,
+        remote_addr: usize,
+        len: usize,
+        timeout_ms: i32,
+    ) -> HixlResult<()> {
+        let engine_c = CString::new(remote_engine).unwrap();
+        let status = unsafe {
+            HixlTransferRead(
+                self.handle,
+                engine_c.as_ptr(),
+                local_addr,
+                remote_addr,
+                len,
+                timeout_ms,
+            )
+        };
+        check_status(status)
+    }
+
     /// Asynchronous memory transfer, returns a request handle.
     pub fn transfer_async(
         &self,

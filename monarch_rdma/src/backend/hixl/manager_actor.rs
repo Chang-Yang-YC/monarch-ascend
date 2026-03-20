@@ -20,6 +20,7 @@
 //! buffer registration/release.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -91,6 +92,10 @@ struct ProcessHixl {
     // exported buffers and transfer-time local buffers.
     registered_by_addr: HashMap<usize, (SendMemHandle, usize)>,
     exported_buf_addrs: HashMap<usize, usize>,
+    // Transfer-side long-lived registrations keyed by local address.
+    // These are intentionally kept registered across transfers to reduce
+    // register/deregister churn before TransferSync.
+    transfer_registered_addrs: HashSet<usize>,
 }
 
 // Safety: hixl_sys::Hixl internally manages thread safety.
@@ -329,12 +334,32 @@ impl ProcessHixl {
     }
 
     fn register_transfer_memory(&mut self, addr: usize, size: usize) -> Result<()> {
+        if self.transfer_registered_addrs.contains(&addr) {
+            return Ok(());
+        }
+
         self.acquire_memory(addr, size, hixl_sys::HixlMemType::HIXL_MEM_DEVICE)
-            .map(|_| ())
+            .map(|_| ())?;
+        self.transfer_registered_addrs.insert(addr);
+        Ok(())
     }
 
     fn deregister_transfer_memory(&mut self, addr: usize) -> Result<()> {
+        if !self.transfer_registered_addrs.remove(&addr) {
+            return Ok(());
+        }
         self.release_memory(addr)
+    }
+
+    fn registration_hit_status(&self, addr: usize) -> (bool, usize) {
+        self.registered_by_addr
+            .get(&addr)
+            .map(|(_, refcnt)| (true, *refcnt))
+            .unwrap_or((false, 0))
+    }
+
+    fn transfer_alignment(addr: usize, len: usize, align: usize) -> bool {
+        addr % align == 0 && len % align == 0
     }
 
     fn transfer_connected(
@@ -354,15 +379,65 @@ impl ProcessHixl {
             ));
         }
 
-        let op_desc = hixl_sys::HixlTransferOpDesc {
+        let (hit_before, refcnt_before) = self.registration_hit_status(local_addr);
+        let align16_ok = Self::transfer_alignment(local_addr, local_size, 16)
+            && Self::transfer_alignment(remote_addr, local_size, 16);
+        let align64_ok = Self::transfer_alignment(local_addr, local_size, 64)
+            && Self::transfer_alignment(remote_addr, local_size, 64);
+        tracing::warn!(
+            "HIXL: registration hit before TransferSync local_addr={:#x} remote_addr={:#x} size={} hit={} refcnt={} remote_engine={} op={:?} align16_ok={} align64_ok={} local_mod16={} remote_mod16={} len_mod16={} local_mod64={} remote_mod64={} len_mod64={}",
             local_addr,
             remote_addr,
-            len: local_size,
-        };
+            local_size,
+            hit_before,
+            refcnt_before,
+            remote_engine,
+            transfer_op,
+            align16_ok,
+            align64_ok,
+            local_addr % 16,
+            remote_addr % 16,
+            local_size % 16,
+            local_addr % 64,
+            remote_addr % 64,
+            local_size % 64,
+        );
 
-        self.hixl
-            .transfer_sync(remote_engine, transfer_op, &[op_desc], timeout_ms)
-            .map_err(|e| anyhow::anyhow!("HIXL transfer to {} failed: {}", remote_engine, e))
+        let transfer_result = match transfer_op {
+            hixl_sys::HixlTransferOp::HIXL_WRITE => self
+                .hixl
+                .transfer_write(remote_engine, local_addr, remote_addr, local_size, timeout_ms),
+            hixl_sys::HixlTransferOp::HIXL_READ => self
+                .hixl
+                .transfer_read(remote_engine, local_addr, remote_addr, local_size, timeout_ms),
+            _ => self
+                .hixl
+                .transfer_sync(
+                    remote_engine,
+                    transfer_op,
+                    &[hixl_sys::HixlTransferOpDesc {
+                        local_addr,
+                        remote_addr,
+                        len: local_size,
+                    }],
+                    timeout_ms,
+                ),
+        }
+        .map_err(|e| anyhow::anyhow!("HIXL transfer to {} failed: {}", remote_engine, e));
+
+        let (hit_after, refcnt_after) = self.registration_hit_status(local_addr);
+        tracing::warn!(
+            "HIXL: registration hit after TransferSync local_addr={:#x} size={} hit={} refcnt={} remote_engine={} op={:?} transfer_ok={}",
+            local_addr,
+            local_size,
+            hit_after,
+            refcnt_after,
+            remote_engine,
+            transfer_op,
+            transfer_result.is_ok(),
+        );
+
+        transfer_result
     }
 }
 
@@ -430,6 +505,7 @@ fn init_process_hixl(engine_id: String, device_id: i32) -> Result<()> {
                     connected_peers: HashMap::new(),
                     registered_by_addr: HashMap::new(),
                     exported_buf_addrs: HashMap::new(),
+                    transfer_registered_addrs: HashSet::new(),
                 })
             })();
 
@@ -569,23 +645,30 @@ pub fn hixl_transfer_sync(
     guard.ensure_connected(remote_engine_id, timeout_ms)?;
     tracing::warn!("hixl_transfer_sync: connected to {}", remote_engine_id);
 
-    let op_desc = hixl_sys::HixlTransferOpDesc {
-        local_addr,
-        remote_addr,
-        len: local_size,
-    };
-
     tracing::warn!("hixl_transfer_sync: calling TransferSync");
-    let result = guard.hixl.transfer_sync(
-        remote_engine_id,
-        transfer_op,
-        &[op_desc],
-        timeout_ms,
-    );
+    let result = match transfer_op {
+        hixl_sys::HixlTransferOp::HIXL_WRITE => {
+            guard
+                .hixl
+                .transfer_write(remote_engine_id, local_addr, remote_addr, local_size, timeout_ms)
+        }
+        hixl_sys::HixlTransferOp::HIXL_READ => {
+            guard
+                .hixl
+                .transfer_read(remote_engine_id, local_addr, remote_addr, local_size, timeout_ms)
+        }
+        _ => guard.hixl.transfer_sync(
+            remote_engine_id,
+            transfer_op,
+            &[hixl_sys::HixlTransferOpDesc {
+                local_addr,
+                remote_addr,
+                len: local_size,
+            }],
+            timeout_ms,
+        ),
+    };
     tracing::warn!("hixl_transfer_sync: TransferSync returned {:?}", result);
-
-    // Release local transfer memory after transfer.
-    let _ = guard.deregister_transfer_memory(local_addr);
 
     result.map_err(|e| anyhow::anyhow!("HIXL transfer to {} failed: {}", remote_engine_id, e))
 }
@@ -741,38 +824,28 @@ impl RdmaBackend for HixlManagerActor {
 
     async fn submit(
         &mut self,
-        _cx: &(impl hyperactor::context::Actor + Send + Sync),
+        cx: &(impl hyperactor::context::Actor + Send + Sync),
         ops: Vec<RdmaOp>,
         timeout: std::time::Duration,
     ) -> Result<()> {
-        let timeout_ms = timeout.as_millis() as i32;
+        // Keep HIXL data plane on a single, bidirectionally-connected path.
+        // This mirrors RdmaRemoteBuffer read/write behavior and avoids submit-only
+        // fast paths that may skip remote back-connect ordering.
+        let timeout_secs = timeout.as_secs().max(1);
 
         for op in ops {
-            let remote_hixl = op
-                .remote
-                .backends
-                .iter()
-                .find_map(|ctx| {
-                    if let crate::backend::RdmaBackendContext::Hixl(buf) = ctx {
-                        return Some(buf.clone());
-                    }
-                    None
-                })
-                .ok_or_else(|| anyhow::anyhow!("No HIXL backend context on remote buffer"))?;
-
-            let transfer_op = match op.op_type {
-                RdmaOpType::ReadIntoLocal => hixl_sys::HixlTransferOp::HIXL_READ,
-                RdmaOpType::WriteFromLocal => hixl_sys::HixlTransferOp::HIXL_WRITE,
-            };
-
-            hixl_transfer_sync(
-                &remote_hixl.engine_id,
-                op.local.addr(),
-                op.local.size(),
-                remote_hixl.addr,
-                transfer_op,
-                timeout_ms,
-            )?;
+            match op.op_type {
+                RdmaOpType::ReadIntoLocal => {
+                    op.remote
+                        .read_into_local(cx, op.local.clone(), timeout_secs)
+                        .await?;
+                }
+                RdmaOpType::WriteFromLocal => {
+                    op.remote
+                        .write_from_local(cx, op.local.clone(), timeout_secs)
+                        .await?;
+                }
+            }
         }
 
         Ok(())

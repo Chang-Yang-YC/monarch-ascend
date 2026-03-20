@@ -354,6 +354,66 @@ HixlStatus HixlTransferSync(HixlHandle handle, const char *remote,
     return s;
 }
 
+HixlStatus HixlTransferWrite(HixlHandle handle, const char *remote,
+                              uintptr_t local_addr, uintptr_t remote_addr,
+                              size_t len, int32_t timeout) {
+    if (!handle || !remote) return HIXL_PARAM_INVALID;
+
+    auto* ctx = static_cast<HixlContext*>(handle);
+    restore_acl_context(ctx->acl_ctx);
+
+    TS_LOG() << "TransferWrite START: remote='" << remote << "'"
+              << " local=" << (void*)local_addr
+              << " remote_addr=" << (void*)remote_addr
+              << " len=" << len
+              << " timeout=" << timeout
+              << " pid=" << getpid()
+              << " tid=" << pthread_self()
+              << " acl_ctx=" << get_current_acl_context() << std::endl;
+
+    auto s = ctx->engine->TransferSync(
+        hixl::AscendString(remote), hixl::WRITE, {hixl::TransferOpDesc{local_addr, remote_addr, len}}, timeout);
+
+    TS_LOG() << "TransferWrite END: status=" << s << std::endl;
+    if (s != 0) {
+#if ACL_AVAILABLE
+        const char* err = aclGetRecentErrMsg();
+        TS_LOG() << "TransferWrite ACL error: " << (err ? err : "none") << std::endl;
+#endif
+    }
+    return s;
+}
+
+HixlStatus HixlTransferRead(HixlHandle handle, const char *remote,
+                             uintptr_t local_addr, uintptr_t remote_addr,
+                             size_t len, int32_t timeout) {
+    if (!handle || !remote) return HIXL_PARAM_INVALID;
+
+    auto* ctx = static_cast<HixlContext*>(handle);
+    restore_acl_context(ctx->acl_ctx);
+
+    TS_LOG() << "TransferRead START: remote='" << remote << "'"
+              << " local=" << (void*)local_addr
+              << " remote_addr=" << (void*)remote_addr
+              << " len=" << len
+              << " timeout=" << timeout
+              << " pid=" << getpid()
+              << " tid=" << pthread_self()
+              << " acl_ctx=" << get_current_acl_context() << std::endl;
+
+    auto s = ctx->engine->TransferSync(
+        hixl::AscendString(remote), hixl::READ, {hixl::TransferOpDesc{local_addr, remote_addr, len}}, timeout);
+
+    TS_LOG() << "TransferRead END: status=" << s << std::endl;
+    if (s != 0) {
+#if ACL_AVAILABLE
+        const char* err = aclGetRecentErrMsg();
+        TS_LOG() << "TransferRead ACL error: " << (err ? err : "none") << std::endl;
+#endif
+    }
+    return s;
+}
+
 HixlStatus HixlTransferAsync(HixlHandle handle, const char *remote,
                               HixlTransferOp op, const HixlTransferOpDesc *descs,
                               size_t n, HixlTransferReq *out) {
