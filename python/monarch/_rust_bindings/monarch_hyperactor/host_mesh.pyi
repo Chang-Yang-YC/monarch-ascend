@@ -52,6 +52,16 @@ class HostMesh:
         """
         ...
 
+    def with_bootstrap(self, bootstrap_command: BootstrapCommand) -> "HostMesh":
+        """
+        Return a new HostMesh that will use the given bootstrap command when
+        spawning procs, overriding the host agent's default.
+
+        Arguments:
+        - `bootstrap_command`: The bootstrap command to use for launching procs.
+        """
+        ...
+
     def _spawn_admin(
         self,
         instance: Instance,
@@ -100,6 +110,17 @@ class HostMesh:
 
         Arguments:
         - `instance`: The instance to use to shutdown the mesh.
+        """
+        ...
+
+    def stop(self, instance: Instance) -> PythonTask[None]:
+        """
+        Stop the hosts in this mesh, releasing all resources but keeping
+        worker processes alive for reconnection. Throws if this object is
+        backed by a reference rather than an owned mesh.
+
+        Arguments:
+        - `instance`: The instance to use to stop the mesh.
         """
         ...
 

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable, Dict, Literal, Optional, Tuple
 
 from monarch._rust_bindings.monarch_hyperactor.alloc import AllocConstraints, AllocSpec
@@ -60,6 +61,18 @@ class HostMesh(MeshTrait):
     """
     HostMesh represents a collection of compute hosts that can be used to spawn
     processes and actors.
+
+    Can be used as an async context manager, which will shut down the hosts on
+    exit:
+    ```
+    host_mesh = job.state().hosts
+    async with host_mesh:
+        # spawn proc meshes, actor meshes, etc.
+    # shutdown() is called automatically on exit.
+    ```
+
+    If you don't want to shutdown the hosts, you don't need to use it as a
+    context manager.
     """
 
     def __init__(
@@ -68,13 +81,13 @@ class HostMesh(MeshTrait):
         region: Region,
         stream_logs: bool,
         is_fake_in_process: bool,
-        _code_sync_proc_mesh: Optional["_Lazy[ProcMesh]"],
+        code_sync_proc_mesh: Optional["_Lazy[ProcMesh]"],
     ) -> None:
-        self._hy_host_mesh = hy_host_mesh
+        self._inner_host_mesh: Optional[Shared[HyHostMesh]] = hy_host_mesh
         self._region = region
         self._stream_logs = stream_logs
         self._is_fake_in_process = is_fake_in_process
-        self._code_sync_proc_mesh: Optional["_Lazy[ProcMesh]"] = _code_sync_proc_mesh
+        self._code_sync_proc_mesh: Optional["_Lazy[ProcMesh]"] = code_sync_proc_mesh
 
     @classmethod
     def _allocate_nonblocking(
@@ -199,6 +212,10 @@ class HostMesh(MeshTrait):
             raise ValueError(
                 f"per_host labels {per_host.labels} overlap with host labels {self._labels}"
             )
+        # This is checked inside the task as well, but we can pre-emptively raise
+        # earlier.
+        if self._inner_host_mesh is None:
+            raise RuntimeError("HostMesh has already been shut down")
 
         async def task() -> HyProcMesh:
             hy_host_mesh = await self._hy_host_mesh
@@ -286,6 +303,37 @@ class HostMesh(MeshTrait):
             is_fake_in_process=False,
         )
 
+    def with_python_executable(self, python_executable: str) -> "HostMesh":
+        """
+        Return a new HostMesh that will use the given Python executable when
+        spawning procs. Procs spawned from this mesh will also inherit this
+        Python executable when they call ``this_host().spawn_procs(...)``.
+
+        Args:
+            python_executable: Path to the Python executable to use.
+
+        Returns:
+            A new HostMesh configured to use the specified Python executable.
+        """
+        _, _, bootstrap_env = _get_bootstrap_args()
+        bootstrap_cmd: BootstrapCommand = BootstrapCommand(
+            python_executable,
+            None,
+            ["-m", "monarch._src.actor.bootstrap_main"],
+            bootstrap_env,
+        )
+
+        async def task() -> HyHostMesh:
+            return (await self._hy_host_mesh).with_bootstrap(bootstrap_cmd)
+
+        return HostMesh(
+            PythonTask.from_coroutine(task()).spawn(),
+            self._region,
+            self._stream_logs,
+            self._is_fake_in_process,
+            None,
+        )
+
     def __reduce_ex__(self, protocol: ...) -> Tuple[Any, Tuple[Any, ...]]:
         return HostMesh, (
             self._hy_host_mesh,
@@ -317,6 +365,12 @@ class HostMesh(MeshTrait):
         if this host mesh is a *reference* rather than *owned*, which can happen
         if this `HostMesh` object was received from a remote actor or if it was
         produced by slicing.
+        After shutting down, the hosts in this mesh will be unusable, and no new
+        HostMeshes will be able to connect to them.
+        If you want to stop everything on the host but keep them available for
+        new clients, use `stop()` instead.
+
+        This is run automatically on __aexit__ when used as an async context manager.
 
         Returns:
             Future[None]: A future that completes when the host mesh has been shut down.
@@ -325,8 +379,42 @@ class HostMesh(MeshTrait):
         async def task() -> None:
             hy_mesh = await self._hy_host_mesh
             await hy_mesh.shutdown(context().actor_instance._as_rust())
+            # Remove the inner host mesh to clean up associated memory.
+            self._inner_host_mesh = None
 
         return Future(coro=task())
+
+    def stop(self) -> Future[None]:
+        """
+        Stop the host mesh, releasing all resources but keeping worker
+        processes alive for reconnection. A new HostMesh can be created that
+        points to the same hosts.
+
+        Like `shutdown`, this throws if the host mesh is a reference
+        rather than owned.
+
+        Returns:
+            Future[None]: A future that completes when the host mesh has been stopped.
+        """
+
+        async def task() -> None:
+            hy_mesh = await self._hy_host_mesh
+            await hy_mesh.stop(context().actor_instance._as_rust())
+
+        return Future(coro=task())
+
+    async def __aenter__(self) -> "HostMesh":
+        if self._inner_host_mesh is None:
+            raise RuntimeError("HostMesh has already been shut down")
+        return self
+
+    async def __aexit__(
+        self, exc_type: object, exc_val: object, exc_tb: object
+    ) -> None:
+        # In case there are multiple nested "async with" statements, we only
+        # want it to close once.
+        if self._inner_host_mesh is not None:
+            await self.shutdown()
 
     async def sync_workspace(
         self,
@@ -355,7 +443,7 @@ class HostMesh(MeshTrait):
     def initialized(self) -> Future[Literal[True]]:
         """
         Future completes with 'True' when the `HostMesh` has initialized.
-        Because `HostMesh` are remote objects, there is no guarentee that the `HostMesh` is
+        Because `HostMesh` are remote objects, there is no guarantee that the `HostMesh` is
         still usable after this completes, only that at some point in the past it was usable.
         """
         hm: Shared[HyHostMesh] = self._hy_host_mesh
@@ -365,6 +453,12 @@ class HostMesh(MeshTrait):
             return True
 
         return Future(coro=task())
+
+    @property
+    def _hy_host_mesh(self) -> Shared[HyHostMesh]:
+        if self._inner_host_mesh is None:
+            raise RuntimeError("HostMesh has already been shut down")
+        return self._inner_host_mesh
 
 
 def hosts_from_config(name: str) -> HostMesh:

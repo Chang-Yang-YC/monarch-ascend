@@ -89,6 +89,74 @@ except `/SKILL.md` (`text/markdown`).
 - `GET {base}/v1/tree`
   Human-readable ASCII topology dump (convenience endpoint).
 
+- `GET {base}/v1/pyspy/{proc_reference}`
+  Requests a py-spy stack dump from the process hosting
+  `{proc_reference}`. The reference must be a valid ProcId
+  (percent-encoded in the URL path). Requires py-spy in the
+  target environment and ptrace permissions.
+
+  Success returns a `PySpyResult` JSON variant:
+  - `{"Ok": {"pid": N, "binary": "...", "stack_traces": [...], "warnings": [...]}}` — structured stack dump
+  - `{"BinaryNotFound": {"searched": [...]}}` — py-spy not available
+  - `{"Failed": {"pid": N, "binary": "...", "exit_code": N, "stderr": "..."}}` — py-spy error
+
+  The endpoint supports worker procs and the service proc. A
+  proc supports py-spy iff its stable handler actor is
+  reachable: the service proc requires `host_agent`; non-service
+  procs require `proc_agent[0]`. On worker procs, the request is
+  handled by ProcAgent. On the service proc (which hosts
+  HostAgent instead of ProcAgent), the bridge automatically
+  routes to HostAgent. If the target agent is not reachable, an
+  immediate `not_found` error is returned instead of waiting for
+  the full bridge timeout. If the probe send itself fails (a
+  bridge-side infrastructure problem), `internal_error` is
+  returned.
+
+  Timeout returns the standard `gateway_timeout` error envelope.
+
+- `GET {base}/v1/config/{proc_reference}`
+  Returns the effective CONFIG-marked configuration entries from the
+  process hosting `{proc_reference}`. The reference must be a valid
+  ProcId (percent-encoded in the URL path).
+
+  Success returns a `ConfigDumpResult` JSON object:
+  ```json
+  {
+    "entries": [
+      {
+        "name": "hyperactor::config::codec_max_frame_length",
+        "value": "1048576",
+        "default_value": "1048576",
+        "source": "Default",
+        "changed_from_default": false,
+        "env_var": "HYPERACTOR_CODEC_MAX_FRAME_LENGTH"
+      }
+    ]
+  }
+  ```
+
+  Each entry contains:
+  - `name` — fully-qualified config key (module_path::key_name)
+  - `value` — current resolved value (display string)
+  - `default_value` — declared default (null if none)
+  - `source` — which layer provided the value: Default,
+    ClientOverride, File, Env, Runtime, or TestOverride
+  - `changed_from_default` — true when value differs from default
+  - `env_var` — environment variable name (null if not env-backed)
+
+  Entries are sorted by `name`. Only CONFIG-marked keys are
+  included (not INTROSPECT keys).
+
+  The endpoint supports worker procs and the service proc. Same
+  routing as py-spy: ProcAgent for worker procs, HostAgent for the
+  service proc. If the target agent is not reachable, an immediate
+  `not_found` error is returned. Timeout returns `gateway_timeout`.
+
+  Automated integration test:
+  ```
+  buck2 test fbcode//monarch/hyperactor_mesh:config_integration_test
+  ```
+
 - `GET {base}/SKILL.md`
   This document.
 
@@ -227,3 +295,36 @@ Compare across sessions. A score regression after a SKILL.md
 change means the edit made the document harder to follow. A
 score regression after a server change means the API or schema
 drifted. Use the schema `$id` to correlate.
+
+## py-spy validation
+
+Automated integration test (runs all three modes — cpu, block,
+mixed — sequentially):
+
+```
+buck2 test fbcode//monarch/hyperactor_mesh:pyspy_integration_test
+```
+
+Manual verification against a live mesh:
+
+1. Start the py-spy workload:
+
+```
+buck2 run fbcode//monarch/python/examples:pyspy_workload -- \
+  --mode cpu --work-ms 500 --concurrency 3
+```
+
+2. Run the verification script (exit codes: 0 PASS, 1 FAIL,
+   2 SKIP when py-spy is unavailable):
+
+```
+buck2 run fbcode//monarch/python/examples:verify_pyspy -- \
+  --admin-url <url> --mode cpu --samples 10 \
+  --cacert /var/facebook/rootcanal/ca.pem \
+  --cert /var/facebook/x509_identities/server.pem \
+  --key /var/facebook/x509_identities/server.pem
+```
+
+Modes: `cpu` (iterative CPU burn), `block` (blocking sleep),
+`mixed` (alternating CPU + async). The verifier checks for
+mode-specific evidence frames in py-spy stacks.

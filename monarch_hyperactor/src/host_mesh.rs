@@ -186,6 +186,12 @@ impl PyHostMesh {
         PyPythonTask::new(mesh_impl)
     }
 
+    fn with_bootstrap(&self, bootstrap_command: &PyBootstrapCommand) -> PyResult<Self> {
+        Ok(Self::new_ref(
+            self.mesh_ref()?.with_bootstrap(bootstrap_command.to_rust()),
+        ))
+    }
+
     /// Spawn a MeshAdminAgent on the head host's system proc and
     /// return its HTTP address as a string.
     ///
@@ -262,6 +268,31 @@ impl PyHostMesh {
             }
             PyHostMesh::Ref(_) => Err(PyRuntimeError::new_err(
                 "cannot shut down `HostMesh` that is a reference instead of owned",
+            )),
+        }
+    }
+
+    fn stop(&self, instance: &PyInstance) -> PyResult<PyPythonTask> {
+        match self {
+            PyHostMesh::Owned(inner) => {
+                let instance = instance.clone();
+                let mesh_borrow = inner.0.clone();
+                let fut = async move {
+                    match mesh_borrow.take().await {
+                        Ok(mut mesh) => {
+                            mesh.stop(instance.deref()).await?;
+                            Ok(())
+                        }
+                        Err(_) => {
+                            tracing::info!("stop was already called on host mesh");
+                            Ok(())
+                        }
+                    }
+                };
+                PyPythonTask::new(fut)
+            }
+            PyHostMesh::Ref(_) => Err(PyRuntimeError::new_err(
+                "cannot stop `HostMesh` that is a reference instead of owned",
             )),
         }
     }

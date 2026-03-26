@@ -25,6 +25,7 @@ pub mod host_agent;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::ops::Deref;
+use std::ops::DerefMut;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +61,7 @@ use crate::host_mesh::host_agent::ProcState;
 use crate::host_mesh::host_agent::SetClientConfigClient;
 use crate::host_mesh::host_agent::ShutdownHostClient;
 use crate::host_mesh::host_agent::SpawnMeshAdminClient;
+use crate::host_mesh::host_agent::StopHostClient;
 use crate::mesh_controller::HostMeshController;
 use crate::mesh_controller::ProcMeshController;
 use crate::proc_agent::ProcAgent;
@@ -68,9 +70,9 @@ use crate::resource;
 use crate::resource::CreateOrUpdateClient;
 use crate::resource::GetRankStatus;
 use crate::resource::GetRankStatusClient;
-use crate::resource::ProcSpec;
 use crate::resource::RankedValues;
 use crate::resource::Status;
+use crate::resource::WaitRankStatusClient;
 use crate::transport::DEFAULT_TRANSPORT;
 
 /// Actor name for `HostMeshController` when spawned as a named child.
@@ -161,6 +163,20 @@ impl HostRef {
             .await?;
         Ok(())
     }
+
+    /// Request a stop of this host: tear down all resources but keep
+    /// the worker process alive for reconnection.
+    pub(crate) async fn stop(&self, cx: &impl hyperactor::context::Actor) -> anyhow::Result<()> {
+        let agent = self.mesh_agent();
+        let terminate_timeout =
+            hyperactor_config::global::get(crate::bootstrap::MESH_TERMINATE_TIMEOUT);
+        let max_in_flight =
+            hyperactor_config::global::get(crate::bootstrap::MESH_TERMINATE_CONCURRENCY);
+        agent
+            .stop_host(cx, terminate_timeout, max_in_flight.clamp(1, 256))
+            .await?;
+        Ok(())
+    }
 }
 
 impl TryFrom<hyperactor_reference::ActorRef<HostAgent>> for HostRef {
@@ -190,15 +206,12 @@ impl FromStr for HostRef {
 ///
 /// # Lifecycle
 /// `HostMesh` owns host lifecycles. Callers **must** invoke
-/// [`HostMesh::shutdown`] for deterministic teardown. The `Drop` impl
-/// performs **best-effort** cleanup only (spawned via Tokio if
-/// available); it is a safety net, not a substitute for orderly
-/// shutdown.
+/// [`HostMesh::shutdown`] for deterministic teardown.
 ///
 /// In tests and production, prefer explicit shutdown to guarantee
 /// that host agents drop their `BootstrapProcManager`s and that all
-/// child procs are reaped.
-#[allow(dead_code)]
+/// child procs are reaped. You can use `shutdown_guard` to get a wrapper
+/// which will try to do a best-effort shutdown on Drop.
 pub struct HostMesh {
     name: Name,
     extent: Extent,
@@ -675,6 +688,53 @@ impl HostMesh {
         }
         Ok(())
     }
+
+    /// Consumes and wraps this HostMesh with a HostMeshShutdownGuard, which will
+    /// ensure shutdown is run on Drop.
+    pub fn shutdown_guard(self) -> HostMeshShutdownGuard {
+        HostMeshShutdownGuard(self)
+    }
+
+    /// Stop all hosts owned by this `HostMesh`, terminating user procs
+    /// but keeping worker processes and their sockets alive for
+    /// reconnection.
+    ///
+    /// After `stop`, the same worker addresses can be passed to
+    /// [`HostMesh::attach`] to create a new mesh.
+    #[hyperactor::instrument(fields(host_mesh=self.name.to_string()))]
+    pub async fn stop(&mut self, cx: &impl hyperactor::context::Actor) -> anyhow::Result<()> {
+        tracing::info!(name = "HostMeshStatus", status = "Stop::Attempt");
+        let mut failed_hosts = vec![];
+        for host in self.current_ref.values() {
+            if let Err(e) = host.stop(cx).await {
+                tracing::warn!(
+                    name = "HostMeshStatus",
+                    status = "Stop::Host::Failed",
+                    %host,
+                    error = %e,
+                    "host stop failed"
+                );
+                failed_hosts.push(host);
+            }
+        }
+        if failed_hosts.is_empty() {
+            tracing::info!(name = "HostMeshStatus", status = "Stop::Success");
+        } else {
+            tracing::error!(
+                name = "HostMeshStatus",
+                status = "Stop::Failed",
+                "host mesh stop failed; check the logs of the failed hosts for details: {:?}",
+                failed_hosts
+            );
+        }
+
+        // Defuse the Drop impl so it doesn't send ShutdownHost to hosts
+        // we intentionally kept alive. Replace the allocation with an
+        // empty Owned variant so Drop has no hosts to iterate.
+        self.allocation = HostMeshAllocation::Owned { hosts: vec![] };
+
+        Ok(())
+    }
 }
 
 impl Deref for HostMesh {
@@ -685,7 +745,24 @@ impl Deref for HostMesh {
     }
 }
 
-impl Drop for HostMesh {
+/// Wrapper around HostMesh that runs shutdown on Drop.
+pub struct HostMeshShutdownGuard(pub HostMesh);
+
+impl Deref for HostMeshShutdownGuard {
+    type Target = HostMesh;
+
+    fn deref(&self) -> &HostMesh {
+        &self.0
+    }
+}
+
+impl DerefMut for HostMeshShutdownGuard {
+    fn deref_mut(&mut self) -> &mut HostMesh {
+        &mut self.0
+    }
+}
+
+impl Drop for HostMeshShutdownGuard {
     /// Best-effort cleanup for owned host meshes on drop.
     ///
     /// When a `HostMesh` is dropped, it attempts to shut down all
@@ -706,11 +783,11 @@ impl Drop for HostMesh {
     fn drop(&mut self) {
         tracing::info!(
             name = "HostMeshStatus",
-            host_mesh = %self.name,
+            host_mesh = %self.0.name,
             status = "Dropping",
         );
         // Snapshot the owned hosts we're responsible for.
-        let hosts: Vec<HostRef> = match &self.allocation {
+        let hosts: Vec<HostRef> = match &self.0.allocation {
             HostMeshAllocation::ProcMesh { hosts, .. } | HostMeshAllocation::Owned { hosts } => {
                 hosts.clone()
             }
@@ -718,8 +795,8 @@ impl Drop for HostMesh {
 
         // Best-effort only when a Tokio runtime is available.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let mesh_name = self.name.clone();
-            let allocation_label = match &self.allocation {
+            let mesh_name = self.0.name.clone();
+            let allocation_label = match &self.0.allocation {
                 HostMeshAllocation::ProcMesh { .. } => "proc_mesh",
                 HostMeshAllocation::Owned { .. } => "owned",
             }
@@ -790,7 +867,7 @@ impl Drop for HostMesh {
             // No runtime here; PDEATHSIG and manager Drop remain the
             // last-resort safety net.
             tracing::warn!(
-                host_mesh = %self.name,
+                host_mesh = %self.0.name,
                 hosts = hosts.len(),
                 "HostMesh dropped without a Tokio runtime; skipping \
                  best-effort shutdown. This indicates that .shutdown() \
@@ -804,7 +881,7 @@ impl Drop for HostMesh {
 
         tracing::info!(
             name = "HostMeshStatus",
-            host_mesh = %self.name,
+            host_mesh = %self.0.name,
             status = "Dropped",
         );
     }
@@ -860,6 +937,10 @@ pub struct HostMeshRef {
     name: Name,
     region: Region,
     ranks: Arc<Vec<HostRef>>,
+    /// Bootstrap command to use when spawning procs on this mesh.
+    /// When `None`, each host agent uses its own default command.
+    #[serde(default)]
+    pub bootstrap_command: Option<BootstrapCommand>,
 }
 wirevalue::register_type!(HostMeshRef);
 
@@ -878,6 +959,7 @@ impl HostMeshRef {
             name,
             region,
             ranks: Arc::new(ranks),
+            bootstrap_command: None,
         })
     }
 
@@ -888,6 +970,7 @@ impl HostMeshRef {
             name,
             region: extent!(hosts = hosts.len()).into(),
             ranks: Arc::new(hosts.into_iter().map(HostRef).collect()),
+            bootstrap_command: None,
         }
     }
 
@@ -905,6 +988,7 @@ impl HostMeshRef {
                     .map(HostRef::try_from)
                     .collect::<crate::Result<_>>()?,
             ),
+            bootstrap_command: None,
         })
     }
 
@@ -917,7 +1001,17 @@ impl HostMeshRef {
             name,
             region: Extent::unity().into(),
             ranks: Arc::new(vec![HostRef::try_from(agent)?]),
+            bootstrap_command: None,
         })
+    }
+
+    /// Return a new `HostMeshRef` that will use `cmd` when spawning procs,
+    /// overriding the host agent's default bootstrap command.
+    pub fn with_bootstrap(self, cmd: BootstrapCommand) -> Self {
+        Self {
+            bootstrap_command: Some(cmd),
+            ..self
+        }
     }
 
     /// Returns the host entries as `(addr_string, ActorRef<HostAgent>)` pairs.
@@ -1115,12 +1209,17 @@ impl HostMeshRef {
                 let proc_name = Name::new(format!("{}_{}", proc_mesh_name.name(), per_host_rank))?;
                 proc_names.push(proc_name.clone());
                 let bind = proc_bind.as_ref().map(|v| v[per_host_rank].clone());
+                let proc_spec = resource::ProcSpec {
+                    client_config_override: client_config_override.clone(),
+                    bootstrap_command: self.bootstrap_command.clone(),
+                    proc_bind: bind,
+                };
                 host.mesh_agent()
                     .create_or_update(
                         cx,
                         proc_name.clone(),
                         resource::Rank::new(create_rank),
-                        ProcSpec::new(client_config_override.clone(), bind),
+                        proc_spec,
                     )
                     .await
                     .map_err(|e| {
@@ -1211,6 +1310,8 @@ impl HostMeshRef {
                             name: proc_name.clone(),
                             status,
                             state: None,
+                            generation: 0,
+                            timestamp: std::time::SystemTime::now(),
                         },
                     };
 
@@ -1364,7 +1465,7 @@ impl HostMeshRef {
                 },
             )?;
             host.mesh_agent()
-                .get_rank_status(cx, proc_name, port.bind())
+                .wait_rank_status(cx, proc_name, Status::Stopped, port.bind())
                 .await?;
 
             tracing::info!(
@@ -1396,7 +1497,7 @@ impl HostMeshRef {
         .await
         {
             Ok(statuses) => {
-                let all_stopped = statuses.values().all(|s| s.is_terminating());
+                let all_stopped = statuses.values().all(|s| s.is_terminated());
                 if !all_stopped {
                     tracing::error!(
                         name = "ProcMeshStatus",
@@ -1520,6 +1621,8 @@ impl HostMeshRef {
                             name: proc_names[rank].clone(),
                             status: resource::Status::Timeout(timeout),
                             state: None,
+                            generation: 0,
+                            timestamp: std::time::SystemTime::now(),
                         },
                     ));
                 }
@@ -1557,7 +1660,10 @@ impl view::RankedSliceable for HostMeshRef {
             .remap(&region)
             .unwrap()
             .map(|index| self.get(index).unwrap().clone());
-        Self::new(self.name.clone(), region, ranks.collect()).unwrap()
+        Self {
+            bootstrap_command: self.bootstrap_command.clone(),
+            ..Self::new(self.name.clone(), region, ranks.collect()).unwrap()
+        }
     }
 }
 

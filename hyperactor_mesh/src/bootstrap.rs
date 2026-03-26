@@ -292,6 +292,10 @@ async fn halt<R>() -> R {
 /// Obtained from [`host`]. Awaiting [`HostShutdownHandle::join`] blocks until
 /// the [`ShutdownHost`] handler sends back the mailbox server handle, drains
 /// it, and (if `exit_on_shutdown`) calls `process::exit`.
+///
+/// Note: [`StopHost`] does **not** trigger this handle — a stopped host
+/// keeps its mailbox server (and Unix socket) alive so new clients can
+/// reconnect to the same address.
 pub struct HostShutdownHandle {
     rx: tokio::sync::oneshot::Receiver<MailboxServerHandle>,
     exit_on_shutdown: bool,
@@ -345,9 +349,9 @@ pub async fn host(
     let host = Host::new(manager, addr).await?;
     let addr = host.addr().clone();
 
-    // The ShutdownHost handler will call host.serve() inside HostAgent::init
-    // (after this.bind::<Self>(), so the actor port is bound before the
-    // frontend starts routing messages), then send the resulting
+    // The ShutdownHost/StopHost handler will call host.serve() inside
+    // HostAgent::init (after this.bind::<Self>(), so the actor port is bound
+    // before the frontend starts routing messages), then send the resulting
     // MailboxServerHandle back here for draining.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<MailboxServerHandle>();
 
@@ -1507,7 +1511,7 @@ impl hyperactor::host::ProcHandle for BootstrapProcHandle {
 }
 
 /// A specification of the command used to bootstrap procs.
-#[derive(Debug, Named, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Named, Serialize, Deserialize, Clone, Default)]
 pub struct BootstrapCommand {
     pub program: PathBuf,
     pub arg0: Option<String>,
@@ -1515,6 +1519,28 @@ pub struct BootstrapCommand {
     pub env: HashMap<String, String>,
 }
 wirevalue::register_type!(BootstrapCommand);
+
+impl std::hash::Hash for BootstrapCommand {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.program.hash(state);
+        self.arg0.hash(state);
+        self.args.hash(state);
+        let mut pairs: Vec<_> = self.env.iter().collect();
+        pairs.sort();
+        pairs.hash(state);
+    }
+}
+
+impl PartialEq for BootstrapCommand {
+    fn eq(&self, other: &Self) -> bool {
+        self.program == other.program
+            && self.arg0 == other.arg0
+            && self.args == other.args
+            && self.env == other.env
+    }
+}
+
+impl Eq for BootstrapCommand {}
 
 impl BootstrapCommand {
     /// Creates a bootstrap command specification to replicate the
@@ -1782,6 +1808,15 @@ impl BootstrapProcManager {
         self.children.lock().await.get(proc_id).map(|h| h.status())
     }
 
+    /// Return a watch receiver for the given proc's status stream,
+    /// if the proc is known to this manager.
+    pub async fn watch(
+        &self,
+        proc_id: &hyperactor_reference::ProcId,
+    ) -> Option<tokio::sync::watch::Receiver<ProcStatus>> {
+        self.children.lock().await.get(proc_id).map(|h| h.watch())
+    }
+
     /// Non-blocking stop: send `StopAll`, then spawn a background task
     /// that waits for exit and escalates if needed.
     ///
@@ -1929,6 +1964,9 @@ pub struct BootstrapProcConfig {
     /// When set, the bootstrap command is wrapped with `numactl`
     /// (on NUMA systems) or `taskset` (Linux fallback) before launch.
     pub proc_bind: Option<ProcBind>,
+    /// Optional bootstrap command override. When set, this command is used
+    /// to spawn the proc instead of the manager's default bootstrap command.
+    pub bootstrap_command: Option<BootstrapCommand>,
 }
 
 #[async_trait]
@@ -2008,7 +2046,11 @@ impl ProcManager for BootstrapProcManager {
         let opts = LaunchOptions {
             bootstrap_payload,
             process_name: format_process_name(&proc_id),
-            command: self.command.clone(),
+            command: config
+                .bootstrap_command
+                .as_ref()
+                .unwrap_or(&self.command)
+                .clone(),
             want_stdio: need_stdio,
             tail_lines: tail_size,
             log_channel: if enable_forwarding {
@@ -2178,10 +2220,11 @@ impl hyperactor::host::BulkTerminate for BootstrapProcManager {
         max_in_flight: usize,
         reason: &str,
     ) -> TerminateSummary {
-        // Snapshot to avoid holding the lock across awaits.
+        // Drain the children list to avoid holding the lock across awaits and
+        // avoid subsequent calls from trying to terminate again.
         let handles: Vec<BootstrapProcHandle> = {
-            let guard = self.children.lock().await;
-            guard.values().cloned().collect()
+            let mut guard = self.children.lock().await;
+            guard.drain().map(|(_, v)| v).collect()
         };
 
         let attempted = handles.len();
@@ -3245,6 +3288,7 @@ mod tests {
                     create_rank: 0,
                     client_config_override: Attrs::new(),
                     proc_bind: None,
+                    bootstrap_command: None,
                 },
             )
             .await
@@ -3315,6 +3359,7 @@ mod tests {
                     create_rank: 0,
                     client_config_override: Attrs::new(),
                     proc_bind: None,
+                    bootstrap_command: None,
                 },
             )
             .await
@@ -3463,13 +3508,18 @@ mod tests {
     #[tokio::test]
     #[cfg(all(fbcode_build, target_os = "linux"))]
     async fn bootstrap_canonical_simple_systemd_launcher() {
-        // Acquire exclusive config lock and select systemd launcher.
-        let config = hyperactor_config::global::lock();
-        let _guard = config.override_key(MESH_PROC_LAUNCHER_KIND, "systemd".to_string());
-
         // Create an actor instance we'll use to send and receive
         // messages.
         let instance = testing::instance();
+
+        // Set an absurdly high flush timeout to prove the flush
+        // completes naturally (host networking stays alive during
+        // worker teardown) and never relies on the timeout.
+        let config = hyperactor_config::global::lock();
+        let _flush_guard = config.override_key(
+            hyperactor::config::FORWARDER_FLUSH_TIMEOUT,
+            std::time::Duration::from_secs(600),
+        );
 
         // Configure a ProcessAllocator with the bootstrap binary.
         let mut allocator = ProcessAllocator::new(Command::new(crate::testresource::get(

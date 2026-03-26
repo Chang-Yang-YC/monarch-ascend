@@ -41,6 +41,9 @@
 //!   effective status is `failed`.
 //! - **IA-5 (payload-totality):** Every `IntrospectResult` sets
 //!   `attrs` -- never omitted, never null.
+//! - **IA-6 (open-row-forward-compat):** View decoders ignore
+//!   unknown attrs keys; only required known keys and local
+//!   invariants affect decoding outcome. Concretized by AV-3.
 //!
 //! ## Attrs view invariants (AV-*)
 //!
@@ -72,11 +75,115 @@
 //!   `NodeProperties::Error` with a `malformed_*` code family,
 //!   without panic.
 //!
-//! ## Open-row invariant (IA-6)
+//! ## py-spy integration (PS-*)
 //!
-//! - **IA-6 (open-row-forward-compat):** View decoders ignore
-//!   unknown attrs keys; only required known keys and local
-//!   invariants affect decoding outcome. Concretized by AV-3.
+//! - **PS-1 (target locality):** `PySpyDump` always targets
+//!   `std::process::id()` of the handling ProcAgent process. No
+//!   caller-supplied PID exists in the API.
+//! - **PS-2 (deterministic failure shape):** Execution failures are
+//!   classified into `BinaryNotFound { searched }` vs
+//!   `Failed { pid, binary, exit_code, stderr }`, never collapsed.
+//! - **PS-3 (binary resolution order):** Resolution order is exactly:
+//!   `PYSPY_BIN` config attr (if non-empty) then `"py-spy"` on PATH.
+//!   The attr is read via `hyperactor_config::global::get_cloned`;
+//!   env var `PYSPY_BIN` feeds in through the config layer.
+//!   If the first attempt is not found, the fallback attempt is
+//!   required.
+//! - **PS-4 (structured JSON output):** py-spy runs with `--json`;
+//!   output is parsed into `Vec<PySpyStackTrace>`. Parse failure
+//!   maps to `PySpyResult::Failed`.
+//! - **PS-5 (subprocess timeout):** `try_exec` bounds the py-spy
+//!   subprocess inside the worker to `MESH_ADMIN_PYSPY_TIMEOUT`
+//!   (default 10s). The budget is sized for `--native --native-all`
+//!   which unwinds native stacks via libunwind — significantly
+//!   slower than Python-only capture on loaded hosts. On expiry the
+//!   child is killed and reaped, and the worker returns
+//!   `Failed { stderr: "…timed out…" }`.
+//! - **PS-6 (bridge timeout):** The HTTP bridge uses a separate
+//!   `MESH_ADMIN_PYSPY_BRIDGE_TIMEOUT` (default 13s), which must
+//!   exceed `MESH_ADMIN_PYSPY_TIMEOUT` so the subprocess kill/reap
+//!   and reply can arrive before the bridge declares
+//!   `gateway_timeout`. Independent of
+//!   `MESH_ADMIN_SINGLE_HOST_TIMEOUT`.
+//! - **PS-7 (non-blocking delegation):** ProcAgent never awaits
+//!   py-spy execution inline. On `PySpyDump` it spawns a child
+//!   `PySpyWorker`, forwards the request, and returns immediately.
+//! - **PS-8 (worker lifecycle):** Each `PySpyWorker` handles
+//!   exactly one forwarded `RunPySpyDump`, replies directly to the
+//!   forwarded `OncePortRef`, then self-terminates via
+//!   `cx.stop()`. Clean exit, no supervision event.
+//! - **PS-9 (concurrent dumps):** py-spy is spawn-per-request, so
+//!   overlapping dumps on the same proc are allowed. Each worker
+//!   runs independently.
+//! - **PS-10 (nonblocking retry):** In nonblocking mode, `try_exec`
+//!   retries up to 3 times with 100ms backoff on failure, because
+//!   py-spy can segfault reading mutating process memory. All
+//!   attempts share a single deadline bounded by
+//!   `MESH_ADMIN_PYSPY_TIMEOUT` (PS-5).
+//! - **PS-11a (native-all-immediate-downgrade):** If py-spy rejects
+//!   `--native-all` with the recognized unsupported-flag signature
+//!   (exit code 2, stderr mentions `--native-all`), `try_exec`
+//!   retries immediately with `native_all = false` in the same outer
+//!   attempt.
+//! - **PS-11b (native-all-no-retry-consumption):** That downgrade
+//!   retry does not consume an outer nonblocking retry slot (PS-10)
+//!   and does not incur the 100ms inter-attempt backoff.
+//! - **PS-11c (native-all-downgrade-warning):** A successful
+//!   downgraded result includes the warning `"--native-all
+//!   unsupported by this py-spy; fell back to --native"`.
+//! - **PS-11d (native-all-failure-passthrough):** If the downgraded
+//!   retry also fails, the failure flows through the normal
+//!   nonblocking retry logic (PS-10) unchanged.
+//! - **PS-11e (native-all-sticky-downgrade):** Once the
+//!   unsupported-flag signature is detected,
+//!   `effective_opts.native_all` remains `false` for all subsequent
+//!   outer retries. The flag is not re-tested on later attempts.
+//! - **PS-12 (universal py-spy):** Worker procs and the service
+//!   proc can handle `PySpyDump`. Worker procs handle it via
+//!   ProcAgent; the service proc handles it via HostAgent (same
+//!   spawn-worker pattern). `pyspy_bridge` routes by proc name:
+//!   if `proc_id.base_name() == SERVICE_PROC_NAME`, the target
+//!   is `host_agent`; otherwise `proc_agent[0]`. Procs lacking
+//!   either agent (e.g. mesh-admin) fast-fail via PS-13.
+//! - **PS-13 (defensive probe):** Before sending `PySpyDump`,
+//!   `pyspy_bridge` probes the selected actor with an introspect
+//!   query bounded by `MESH_ADMIN_QUERY_CHILD_TIMEOUT` (default
+//!   100ms). Three outcomes: (a) probe reply arrives — proceed
+//!   with `PySpyDump`; (b) probe times out or recv closes —
+//!   return `not_found` (actor absent/unreachable); (c) probe
+//!   send itself fails — return `internal_error` (bridge-side
+//!   infrastructure failure). Cases (b) and (c) fast-fail
+//!   instead of waiting the full 13s
+//!   `MESH_ADMIN_PYSPY_BRIDGE_TIMEOUT`.
+//! - **PS-14 (reachability-based capability):** A proc supports
+//!   py-spy iff its stable handler actor is reachable: the
+//!   service proc requires a reachable `host_agent`; non-service
+//!   procs require a reachable `proc_agent[0]`. `PySpyWorker` is
+//!   transient per-request machinery (spawned on `PySpyDump`,
+//!   stopped after replying) and is not part of the reachability
+//!   contract.
+//!
+//! v1 contract notes:
+//! - The current py-spy bridge expects a ProcId-form reference and
+//!   rejects other forms as `bad_request`. This may be broadened in
+//!   future versions.
+//! - If `worker.send()` fails after the reply port has moved into
+//!   `RunPySpyDump`, the caller receives no explicit
+//!   `PySpyResult::Failed` — they observe a timeout.
+//!   `MailboxSenderError` does not carry the unsent message, so the
+//!   port is irrecoverable on this path.
+//! - **Contract change (D96756537 follow-up):** `PySpyResult::Ok`
+//!   replaced `stack: String` (raw py-spy text) with
+//!   `stack_traces: Vec<PySpyStackTrace>` (structured JSON) and
+//!   added `warnings: Vec<String>`. Clients reading the old `stack`
+//!   field will see it absent; they must migrate to `stack_traces`.
+//!
+//! ## Mesh-admin config (MA-*)
+//!
+//! - **MA-C1 (timeout config centralization):** Mesh-admin timeout
+//!   budgets are read from config attrs at call-time, with defaults
+//!   in `config.rs`. No hardcoded timeout constants in
+//!   `mesh_admin.rs`.
 
 use hyperactor_config::Attrs;
 use hyperactor_config::INTROSPECT;
@@ -993,7 +1100,7 @@ mod tests {
     ///   @fbcode//mode/dev-nosan -- \
     ///   fbcode/monarch/hyperactor_mesh/src/testdata
     /// ```
-    /// Strip the `$comment` field (containing the `@generated` marker)
+    /// Strip the `$comment` field (containing the @\u{200B}generated marker)
     /// from a JSON value so snapshot comparisons ignore it.
     fn strip_comment(mut value: serde_json::Value) -> serde_json::Value {
         if let Some(obj) = value.as_object_mut() {

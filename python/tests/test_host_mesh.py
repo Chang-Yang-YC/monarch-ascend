@@ -9,6 +9,10 @@
 import os
 import pathlib
 import shutil
+import stat
+import sys
+import tempfile
+import textwrap
 import threading
 import time
 from typing import List, Set
@@ -112,6 +116,19 @@ class RankActor(Actor):
     async def get_rank(self) -> int:
         return context().actor_instance.rank.rank
 
+    @endpoint
+    async def get_pid(self) -> int:
+        return os.getpid()
+
+
+def is_process_running(pid: int) -> bool:
+    """Check if a process with the given PID is still running."""
+    try:
+        os.kill(pid, 0)  # Signal 0 doesn't kill, just checks if process exists
+        return True
+    except OSError:
+        return False
+
 
 @pytest.mark.timeout(60)
 @isolate_in_subprocess
@@ -121,6 +138,22 @@ def test_shutdown_host_mesh() -> None:
     am = pm.spawn("actor", RankActor)
     am.get_rank.choose().get()
     hm.shutdown().get()
+
+
+@pytest.mark.timeout(60)
+@isolate_in_subprocess
+async def test_host_mesh_context_manager() -> None:
+    """Tests that the HostMesh can be used as a context manager and that it runs
+    shutdown on exit"""
+    async with ProcessJob({"hosts": 2}).state(cached_path=None).hosts as hm:
+        pm = hm.spawn_procs(per_host={"gpus": 2})
+        am = pm.spawn("actor", RankActor)
+        await am.get_rank.choose()
+    # Ensure that other operations fail after shutdown.
+    with pytest.raises(RuntimeError, match="HostMesh has already been shut down"):
+        hm.spawn_procs(per_host={"gpus": 2})
+    with pytest.raises(RuntimeError, match="HostMesh has already been shut down"):
+        await hm.shutdown()
 
 
 @pytest.mark.timeout(60)
@@ -140,6 +173,41 @@ def test_shutdown_unpickled_host_mesh_throws_exception() -> None:
     with pytest.raises(RuntimeError):
         hm_unpickled.shutdown().get()
     hm.shutdown().get()
+
+
+@pytest.mark.timeout(120)
+@isolate_in_subprocess
+def test_stop_and_reconnect() -> None:
+    job = ProcessJob({"hosts": 2})
+
+    # First connection: spawn actors, verify they work.
+    hm = job.state(cached_path=None).hosts
+    pm = hm.spawn_procs(per_host={"gpus": 1})
+    am = pm.spawn("actor", RankActor)
+    pids = am.get_pid.call().get()
+    assert len(pids) == 2
+    pids = [pid for _, pid in pids.items()]
+
+    # Stop: terminate user procs but keep workers alive.
+    hm.stop().get()
+    # Ensure that the procs are actually dead.
+    assert all(not is_process_running(pid) for pid in pids)
+
+    # Sleep for a bit to ensure that there's no error after the stop. 30 seconds
+    # is the default channel timeout for an undeliverable message. The actor
+    # mesh and proc mesh controllers should be able to stop fine and not send
+    # any messages to the dead procs and actors.
+    time.sleep(35)
+
+    # Second connection: reconnect to the same workers via state().
+    hm2 = job.state(cached_path=None).hosts
+    pm2 = hm2.spawn_procs(per_host={"gpus": 1})
+    am2 = pm2.spawn("actor", RankActor)
+    ranks2 = am2.get_rank.call().get()
+    assert len(ranks2) == 2
+
+    # Shutdown: fully tear down and exit workers.
+    hm2.shutdown().get()
 
 
 class PidActor(Actor):
@@ -294,4 +362,73 @@ def test_spawn_procs_with_taskset_bind() -> None:
     observed = {frozenset(cpus) for cpus in affinities.values()}
     assert observed == {frozenset({cpu_a}), frozenset({cpu_b})}, (
         f"expected affinities {{{cpu_a}}} and {{{cpu_b}}}, got {affinities}"
+    )
+
+
+class WrapperMarkerActor(Actor):
+    """Returns the PID stamped by the wrapper executable."""
+
+    @endpoint
+    def get_wrapper_pid(self) -> str:
+        return os.environ.get("PYTHON_WRAPPER_PID", "")
+
+    @endpoint
+    def spawn_inner(self) -> "WrapperMarkerActor":
+        """Spawns a new proc via this_host() to test recursive propagation."""
+        return (
+            this_host()
+            .spawn_procs(per_host={"procs": 1})
+            .spawn("inner_marker", WrapperMarkerActor)
+        )
+
+
+def _make_python_wrapper() -> str:
+    """
+    Write a shell wrapper that stamps PYTHON_WRAPPER_PID=$$ (the wrapper
+    shell's PID) and execs to the real Python interpreter.
+
+    Using the PID rather than a plain boolean means each wrapper invocation
+    produces a *different* value.  The recursive test can therefore verify
+    that the wrapper ran a second time (producing a different PID) rather than
+    just inheriting the first PID from the parent process environment.
+    """
+    real_python = sys.executable
+    tmpdir = tempfile.mkdtemp(prefix="monarch_test_python_exe_")
+    wrapper_path = os.path.join(tmpdir, "python_wrapper")
+    with open(wrapper_path, "w") as f:
+        f.write(
+            textwrap.dedent(
+                f"""\
+                #!/bin/sh
+                export PYTHON_WRAPPER_PID=$$
+                exec {real_python} "$@"
+                """
+            )
+        )
+    os.chmod(wrapper_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+    return wrapper_path
+
+
+@pytest.mark.timeout(60)
+@isolate_in_subprocess
+def test_with_python_executable() -> None:
+    wrapper_path = _make_python_wrapper()
+    modified_host = this_host().with_python_executable(wrapper_path)
+
+    # Direct spawn: proc should be launched via the wrapper; wrapper PID is set.
+    am = modified_host.spawn_procs(per_host={"procs": 1}).spawn(
+        "marker", WrapperMarkerActor
+    )
+    direct_pid = am.get_wrapper_pid.call_one().get()
+    assert direct_pid != "", "wrapper was not executed for direct spawn"
+
+    # Recursive spawn: actor calls this_host().spawn_procs() and the inner proc
+    # should also be launched via the wrapper — proving the bootstrap command is
+    # stored on the HostMeshRef and propagated.  The wrapper PID must differ
+    # from the direct-spawn PID, ruling out simple env-var inheritance.
+    inner_am = am.spawn_inner.call_one().get()
+    inner_pid = inner_am.get_wrapper_pid.call_one().get()
+    assert inner_pid != "", "wrapper was not executed for recursive spawn"
+    assert inner_pid != direct_pid, (
+        "recursive spawn inherited PID instead of re-running wrapper"
     )

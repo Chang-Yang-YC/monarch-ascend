@@ -15,6 +15,7 @@
 #![allow(unused_assignments)]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -54,8 +55,12 @@ use crate::bootstrap;
 use crate::bootstrap::BootstrapCommand;
 use crate::bootstrap::BootstrapProcConfig;
 use crate::bootstrap::BootstrapProcManager;
+use crate::config_dump::ConfigDump;
+use crate::config_dump::ConfigDumpResult;
 use crate::mesh_admin::MeshAdminMessageClient;
 use crate::proc_agent::ProcAgent;
+use crate::pyspy::PySpyDump;
+use crate::pyspy::PySpyWorker;
 use crate::resource;
 use crate::resource::ProcSpec;
 
@@ -214,21 +219,48 @@ pub const HOST_MESH_AGENT_ACTOR_NAME: &str = "host_agent";
 
 /// A mesh agent is responsible for managing a host in a [`HostMesh`],
 /// through the resource behaviors defined in [`crate::resource`].
+/// Self-notification sent by bridge tasks when a proc's status changes.
+/// Not exported or registered — only used internally via `PortHandle`.
+#[derive(Debug, Serialize, Deserialize, Named)]
+struct ProcStatusChanged {
+    name: Name,
+}
+
 #[hyperactor::export(
     handlers=[
         resource::CreateOrUpdate<ProcSpec>,
         resource::Stop,
         resource::GetState<ProcState>,
         resource::GetRankStatus { cast = true },
+        resource::WaitRankStatus { cast = true },
         resource::List,
         ShutdownHost,
+        StopHost,
         SpawnMeshAdmin,
         SetClientConfig,
+        ProcStatusChanged,
+        PySpyDump,
+        ConfigDump,
     ]
 )]
 pub struct HostAgent {
     pub(crate) host: Option<HostAgentMode>,
     pub(crate) created: HashMap<Name, ProcCreationState>,
+    /// Pending `WaitRankStatus` waiters, keyed by resource name.
+    /// Each entry is `(min_status, rank, reply_port)`. Only touched
+    /// from `&mut self` handlers.
+    pending_proc_waiters: HashMap<
+        Name,
+        Vec<(
+            resource::Status,
+            usize,
+            hyperactor_reference::PortRef<crate::StatusOverlay>,
+        )>,
+    >,
+    /// Procs that already have an active bridge task watching their status.
+    watching: HashSet<Name>,
+    /// Port handle for sending `ProcStatusChanged` to self. Set in `init()`.
+    proc_status_port: Option<PortHandle<ProcStatusChanged>>,
     /// Lazily initialized ProcAgent on the host's local proc.
     /// Boots on first [`GetLocalProc`] (LP-1 — see
     /// `hyperactor::host::LOCAL_PROC_NAME`).
@@ -236,7 +268,8 @@ pub struct HostAgent {
     /// Handle to the host's frontend mailbox server, set during `init` after
     /// `this.bind::<Self>()` ensures the actor port is registered before the
     /// mailbox starts routing messages. Sent back to the bootstrap loop via
-    /// `shutdown_tx` when the host shuts down so the caller can drain it.
+    /// `shutdown_tx` when the host shuts down so the caller can
+    /// drain it.
     mailbox_handle: Option<MailboxServerHandle>,
 }
 
@@ -246,9 +279,42 @@ impl HostAgent {
         Self {
             host: Some(host),
             created: HashMap::new(),
+            pending_proc_waiters: HashMap::new(),
+            watching: HashSet::new(),
+            proc_status_port: None,
             local_mesh_agent: OnceLock::new(),
             mailbox_handle: None,
         }
+    }
+
+    /// Terminate all tracked children on the host and clear proc state.
+    ///
+    /// The host, system proc, mailbox server, and HostAgent all stay
+    /// alive — only user procs are killed. After this returns the host
+    /// is ready to accept new spawn requests with the same proc names.
+    async fn terminate_children_and_clear(
+        &mut self,
+        cx: &Context<'_, Self>,
+        timeout: std::time::Duration,
+        max_in_flight: usize,
+    ) {
+        if let Some(host_mode) = self.host.as_mut() {
+            match host_mode {
+                HostAgentMode::Process { host, .. } => {
+                    let summary = host
+                        .terminate_children(cx, timeout, max_in_flight.clamp(1, 256), "stop host")
+                        .await;
+                    tracing::info!(?summary, "terminated children on host");
+                }
+                HostAgentMode::Local(host) => {
+                    let summary = host
+                        .terminate_children(cx, timeout, max_in_flight, "stop host")
+                        .await;
+                    tracing::info!(?summary, "terminated children on local host");
+                }
+            }
+        }
+        self.created.clear();
     }
 
     /// Publish the current host properties and children list for
@@ -404,6 +470,8 @@ impl Actor for HostAgent {
             }
         });
 
+        self.proc_status_port = Some(this.port::<ProcStatusChanged>());
+
         Ok(())
     }
 }
@@ -442,6 +510,7 @@ impl Handler<resource::CreateOrUpdate<ProcSpec>> for HostAgent {
                             .client_config_override
                             .clone(),
                         proc_bind: create_or_update.spec.proc_bind.clone(),
+                        bootstrap_command: create_or_update.spec.bootstrap_command.clone(),
                     },
                 )
                 .await
@@ -452,16 +521,46 @@ impl Handler<resource::CreateOrUpdate<ProcSpec>> for HostAgent {
             }
         };
 
+        let rank = create_or_update.rank.unwrap();
+
         if let Err(e) = &created {
             tracing::error!("failed to spawn proc {}: {}", create_or_update.name, e);
         }
         self.created.insert(
             create_or_update.name.clone(),
-            ProcCreationState {
-                rank: create_or_update.rank.unwrap(),
-                created,
-            },
+            ProcCreationState { rank, created },
         );
+
+        // If any WaitRankStatus messages arrived before this proc
+        // existed, their waiters were stashed with a sentinel rank.
+        // Now that we know the real rank, fix them up and start a
+        // watch bridge.
+        // Extract the proc_id before mutably borrowing pending_proc_waiters.
+        let proc_id = self
+            .created
+            .get(&create_or_update.name)
+            .and_then(|s| s.created.as_ref().ok())
+            .map(|(pid, _)| pid.clone());
+
+        if let Some(waiters) = self.pending_proc_waiters.get_mut(&create_or_update.name) {
+            for (_, waiter_rank, _) in waiters.iter_mut() {
+                if *waiter_rank == usize::MAX {
+                    *waiter_rank = rank;
+                }
+            }
+        }
+
+        // Start a bridge and send ourselves an initial check.
+        if self
+            .pending_proc_waiters
+            .contains_key(&create_or_update.name)
+        {
+            if let Some(proc_id) = &proc_id {
+                self.start_watch_bridge(&create_or_update.name, proc_id)
+                    .await;
+            }
+            self.notify_proc_status_changed(&create_or_update.name);
+        }
 
         self.publish_introspect_properties(cx);
         Ok(())
@@ -491,6 +590,9 @@ impl Handler<resource::Stop> for HostAgent {
             host.request_stop(cx, proc_id, timeout, &message.reason)
                 .await;
         }
+
+        // Status may have changed to Stopping; notify pending waiters.
+        self.notify_proc_status_changed(&message.name);
 
         self.publish_introspect_properties(cx);
         Ok(())
@@ -548,6 +650,193 @@ impl Handler<resource::GetRankStatus> for HostAgent {
     }
 }
 
+#[async_trait]
+impl Handler<resource::WaitRankStatus> for HostAgent {
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        msg: resource::WaitRankStatus,
+    ) -> anyhow::Result<()> {
+        use crate::StatusOverlay;
+        use crate::resource::Status;
+
+        match self.created.get(&msg.name) {
+            Some(ProcCreationState {
+                rank,
+                created: Ok((proc_id, _)),
+            }) => {
+                let rank = *rank;
+                let status = match self.host.as_ref() {
+                    Some(host) => host.proc_status(proc_id).await.0,
+                    None => Status::Stopped,
+                };
+
+                // If already at or past the requested threshold, reply immediately.
+                if status >= msg.min_status {
+                    let overlay = StatusOverlay::try_from_runs(vec![(rank..(rank + 1), status)])
+                        .expect("valid single-run overlay");
+                    let _ = msg.reply.send(cx, overlay);
+                    return Ok(());
+                }
+
+                // Stash the waiter and start a bridge if we don't have one yet.
+                self.pending_proc_waiters
+                    .entry(msg.name.clone())
+                    .or_default()
+                    .push((msg.min_status, rank, msg.reply));
+
+                let proc_id = proc_id.clone();
+                self.start_watch_bridge(&msg.name, &proc_id).await;
+            }
+            Some(ProcCreationState {
+                rank,
+                created: Err(e),
+                ..
+            }) => {
+                // Creation failed — reply immediately with Failed status.
+                let overlay = StatusOverlay::try_from_runs(vec![(
+                    *rank..(*rank + 1),
+                    Status::Failed(e.to_string()),
+                )])
+                .expect("valid single-run overlay");
+                let _ = msg.reply.send(cx, overlay);
+            }
+            None => {
+                // Proc doesn't exist yet. Stash the waiter with a
+                // sentinel rank; CreateOrUpdate will fill it in and
+                // start the watch bridge.
+                self.pending_proc_waiters
+                    .entry(msg.name.clone())
+                    .or_default()
+                    .push((msg.min_status, usize::MAX, msg.reply));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<ProcStatusChanged> for HostAgent {
+    async fn handle(&mut self, cx: &Context<Self>, msg: ProcStatusChanged) -> anyhow::Result<()> {
+        use crate::StatusOverlay;
+        use crate::resource::Status;
+
+        let status = match self.created.get(&msg.name) {
+            Some(ProcCreationState {
+                created: Ok((proc_id, _)),
+                ..
+            }) => match self.host.as_ref() {
+                Some(host) => host.proc_status(proc_id).await.0,
+                None => Status::Stopped,
+            },
+            Some(ProcCreationState {
+                created: Err(_), ..
+            }) => {
+                // Already replied with Failed when they were stashed.
+                return Ok(());
+            }
+            None => {
+                // Proc not created yet, nothing to flush.
+                return Ok(());
+            }
+        };
+
+        let Some(waiters) = self.pending_proc_waiters.get_mut(&msg.name) else {
+            return Ok(());
+        };
+
+        let remaining = std::mem::take(waiters);
+        for (min_status, rank, reply) in remaining {
+            if status >= min_status {
+                let overlay =
+                    StatusOverlay::try_from_runs(vec![(rank..(rank + 1), status.clone())])
+                        .expect("valid single-run overlay");
+                let _ = reply.send(cx, overlay);
+            } else {
+                waiters.push((min_status, rank, reply));
+            }
+        }
+
+        if waiters.is_empty() {
+            self.pending_proc_waiters.remove(&msg.name);
+        }
+
+        Ok(())
+    }
+}
+
+impl HostAgent {
+    /// Send a `ProcStatusChanged` self-notification for the given proc name.
+    fn notify_proc_status_changed(&self, name: &Name) {
+        if let Some(port) = &self.proc_status_port {
+            let client = Instance::<()>::self_client();
+            let _ = port.send(client, ProcStatusChanged { name: name.clone() });
+        }
+    }
+
+    /// Start a bridge task that watches a proc's status channel and sends
+    /// `ProcStatusChanged` to self on each change. At most one bridge per proc.
+    async fn start_watch_bridge(&mut self, name: &Name, proc_id: &hyperactor_reference::ProcId) {
+        if self.watching.contains(name) {
+            return;
+        }
+        self.watching.insert(name.clone());
+
+        let port = match &self.proc_status_port {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        match self.host.as_ref() {
+            Some(HostAgentMode::Process { host, .. }) => {
+                if let Some(rx) = host.manager().watch(proc_id).await {
+                    start_proc_watch(port, rx, name.clone(), |s| s.clone().into());
+                }
+            }
+            Some(HostAgentMode::Local(host)) => {
+                if let Some(rx) = host.manager().watch(proc_id).await {
+                    start_proc_watch(port, rx, name.clone(), |s| (*s).into());
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+/// Spawn a bridge task that watches a proc's status channel and sends
+/// `ProcStatusChanged` to the actor via the given `PortHandle`.
+fn start_proc_watch<S>(
+    port: PortHandle<ProcStatusChanged>,
+    mut rx: tokio::sync::watch::Receiver<S>,
+    name: Name,
+    to_status: impl Fn(&S) -> resource::Status + Send + 'static,
+) where
+    S: Send + Sync + 'static,
+{
+    // TODO: replace Instance::self_client() with a proper mechanism
+    // for sending to port handles without an actor context.
+    let client = Instance::<()>::self_client();
+    tokio::spawn(async move {
+        loop {
+            match rx.changed().await {
+                Ok(()) => {
+                    let status = to_status(&*rx.borrow());
+                    let terminated = status.is_terminated();
+                    let _ = port.send(client, ProcStatusChanged { name: name.clone() });
+                    if terminated {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = port.send(client, ProcStatusChanged { name: name.clone() });
+                    return;
+                }
+            }
+        }
+    });
+}
+
 #[derive(Serialize, Deserialize, Debug, Named, Handler, RefClient, HandleClient)]
 pub struct ShutdownHost {
     /// Grace window: send SIGTERM and wait this long before
@@ -561,50 +850,81 @@ pub struct ShutdownHost {
 }
 wirevalue::register_type!(ShutdownHost);
 
+/// Stop the host: tear down all resources (procs, host, router) but
+/// keep the worker process alive so a new client can re-bootstrap.
+/// TODO: consider generalizing resource::StopAll to use for this case.
+#[derive(Serialize, Deserialize, Debug, Named, Handler, RefClient, HandleClient)]
+pub struct StopHost {
+    /// Grace window: send SIGTERM and wait this long before
+    /// escalating.
+    pub timeout: std::time::Duration,
+    /// Max number of children to terminate concurrently on this host.
+    pub max_in_flight: usize,
+    /// Ack that the agent finished stop work (best-effort).
+    #[reply]
+    pub ack: hyperactor::reference::PortRef<()>,
+}
+wirevalue::register_type!(StopHost);
+
+#[async_trait]
+impl Handler<StopHost> for HostAgent {
+    async fn handle(&mut self, cx: &Context<Self>, msg: StopHost) -> anyhow::Result<()> {
+        // Terminate children BEFORE acking, so the caller's networking
+        // stays alive while children flush their forwarders during
+        // teardown. If we ack first, the caller proceeds to tear down
+        // the host proc's networking while children are still running,
+        // causing their forwarder flushes to hang until
+        // MESSAGE_DELIVERY_TIMEOUT expires.
+        self.terminate_children_and_clear(cx, msg.timeout, msg.max_in_flight)
+            .await;
+
+        // Ack after children are terminated so the caller does not
+        // tear down the host's networking prematurely.
+        let (return_handle, mut return_receiver) = cx.mailbox().open_port();
+        cx.mailbox()
+            .serialize_and_send(&msg.ack, (), return_handle)?;
+        if return_receiver.recv().await.is_ok() {
+            tracing::warn!("failed to send ack");
+        }
+        tracing::info!(
+            proc_id = %cx.self_id().proc_id(),
+            actor_id = %cx.self_id(),
+            "host stopped, ready for new client"
+        );
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Handler<ShutdownHost> for HostAgent {
     async fn handle(&mut self, cx: &Context<Self>, msg: ShutdownHost) -> anyhow::Result<()> {
-        // Ack immediately so caller can stop waiting.
+        // Terminate children BEFORE acking, so the caller's networking
+        // stays alive while children flush their forwarders during
+        // teardown. If we ack first, the caller proceeds to tear down
+        // the host proc's networking while children are still running,
+        // causing their forwarder flushes to hang until
+        // MESSAGE_DELIVERY_TIMEOUT expires.
+        self.terminate_children_and_clear(cx, msg.timeout, msg.max_in_flight)
+            .await;
+
+        // Ack after children are terminated so the caller does not
+        // tear down the host's networking prematurely.
         let (return_handle, mut return_receiver) = cx.mailbox().open_port();
         cx.mailbox()
             .serialize_and_send(&msg.ack, (), return_handle)?;
 
-        let mut shutdown_tx = None;
-        if let Some(host_mode) = self.host.take() {
-            match host_mode {
-                HostAgentMode::Process {
-                    host,
-                    shutdown_tx: tx,
-                } => {
-                    let summary = host
-                        .terminate_children(
-                            cx,
-                            msg.timeout,
-                            msg.max_in_flight.clamp(1, 256),
-                            "shutdown host",
-                        )
-                        .await;
-                    tracing::info!(?summary, "terminated children on host");
-                    shutdown_tx = tx;
-                }
-                HostAgentMode::Local(host) => {
-                    let summary = host
-                        .terminate_children(cx, msg.timeout, msg.max_in_flight, "shutdown host")
-                        .await;
-                    tracing::info!(?summary, "terminated children on local host");
-                }
-            }
-        }
-
-        // If message is returned, it means it ack was not sent successfully.
+        // If message is returned, it means the ack was not sent successfully.
         if return_receiver.recv().await.is_ok() {
             tracing::warn!("failed to send ack");
         }
 
-        // Drop the host to release any resources that somehow survived.
-        let _ = self.host.take();
-
-        if let Some(tx) = shutdown_tx {
+        // Drop the host and signal the bootstrap loop to drain the
+        // mailbox and exit.
+        if let Some(HostAgentMode::Process {
+            shutdown_tx: Some(tx),
+            ..
+        }) = self.host.take()
+        {
             tracing::info!(
                 proc_id = %cx.self_id().proc_id(),
                 actor_id = %cx.self_id(),
@@ -658,6 +978,8 @@ impl Handler<resource::GetState<ProcState>> for HostAgent {
                         bootstrap_command,
                         proc_status,
                     }),
+                    generation: 0,
+                    timestamp: std::time::SystemTime::now(),
                 }
             }
             Some(ProcCreationState {
@@ -666,11 +988,15 @@ impl Handler<resource::GetState<ProcState>> for HostAgent {
                 name: get_state.name.clone(),
                 status: resource::Status::Failed(e.to_string()),
                 state: None,
+                generation: 0,
+                timestamp: std::time::SystemTime::now(),
             },
             None => resource::State {
                 name: get_state.name.clone(),
                 status: resource::Status::NotExist,
                 state: None,
+                generation: 0,
+                timestamp: std::time::SystemTime::now(),
             },
         };
 
@@ -824,6 +1150,34 @@ impl Handler<GetLocalProc> for HostAgent {
     }
 }
 
+#[async_trait]
+impl Handler<PySpyDump> for HostAgent {
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        message: PySpyDump,
+    ) -> Result<(), anyhow::Error> {
+        PySpyWorker::spawn_and_forward(cx, message.opts, message.result)
+    }
+}
+
+#[async_trait]
+impl Handler<ConfigDump> for HostAgent {
+    async fn handle(
+        &mut self,
+        cx: &Context<Self>,
+        message: ConfigDump,
+    ) -> Result<(), anyhow::Error> {
+        let entries = hyperactor_config::global::config_entries();
+        // Reply is best-effort: the caller may have timed out and dropped
+        // the once-port.  That must not crash this actor.
+        if let Err(e) = message.result.send(cx, ConfigDumpResult { entries }) {
+            tracing::warn!("HostAgent: ConfigDump reply undeliverable (caller timed out): {e}",);
+        }
+        Ok(())
+    }
+}
+
 /// A trampoline actor that spawns a [`Host`], and sends a reference to the
 /// corresponding [`HostAgent`] to the provided reply port.
 ///
@@ -922,6 +1276,8 @@ mod tests {
     use crate::bootstrap::ProcStatus;
     use crate::resource::CreateOrUpdateClient;
     use crate::resource::GetStateClient;
+    use crate::resource::StopClient;
+    use crate::resource::WaitRankStatusClient;
 
     #[tokio::test]
     #[cfg(fbcode_build)]
@@ -976,10 +1332,178 @@ mod tests {
                     proc_status: Some(ProcStatus::Ready { started_at: _, addr: _, agent: proc_status_mesh_agent}),
                     ..
                 }),
+                ..
             } if name == resource_name
               && proc_id == hyperactor_reference::ProcId::with_name(host_addr.clone(), name.to_string())
               && mesh_agent == hyperactor_reference::ActorRef::attest(hyperactor_reference::ProcId::with_name(host_addr.clone(), name.to_string()).actor_id(crate::proc_agent::PROC_AGENT_ACTOR_NAME, 0)) && bootstrap_command == Some(BootstrapCommand::test())
               && mesh_agent == proc_status_mesh_agent
         );
+    }
+
+    /// WaitRankStatus on a running proc replies immediately with Running.
+    #[tokio::test]
+    #[cfg(fbcode_build)]
+    async fn test_wait_rank_status_already_running() {
+        let host = Host::new(
+            BootstrapProcManager::new(BootstrapCommand::test()).unwrap(),
+            ChannelTransport::Unix.any(),
+        )
+        .await
+        .unwrap();
+
+        let system_proc = host.system_proc().clone();
+        let host_agent = system_proc
+            .spawn(
+                HOST_MESH_AGENT_ACTOR_NAME,
+                HostAgent::new(HostAgentMode::Process {
+                    host,
+                    shutdown_tx: None,
+                }),
+            )
+            .unwrap();
+
+        let client_proc = Proc::direct(ChannelTransport::Unix.any(), "client".to_string()).unwrap();
+        let (client, _client_handle) = client_proc.instance("client").unwrap();
+
+        let name = Name::new("proc1").unwrap();
+        host_agent
+            .create_or_update(
+                &client,
+                name.clone(),
+                resource::Rank::new(0),
+                ProcSpec::default(),
+            )
+            .await
+            .unwrap();
+
+        // Proc is Running; wait for Running should reply immediately.
+        let (port, mut rx) = client.open_port::<crate::StatusOverlay>();
+        host_agent
+            .wait_rank_status(&client, name, resource::Status::Running, port.bind())
+            .await
+            .unwrap();
+
+        let overlay = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("reply timed out")
+            .expect("reply channel closed");
+        assert!(!overlay.is_empty(), "expected non-empty overlay");
+    }
+
+    /// WaitRankStatus for Stopped, then stop the proc — reply should
+    /// arrive only after the proc actually stops.
+    #[tokio::test]
+    #[cfg(fbcode_build)]
+    async fn test_wait_rank_status_stop() {
+        let host = Host::new(
+            BootstrapProcManager::new(BootstrapCommand::test()).unwrap(),
+            ChannelTransport::Unix.any(),
+        )
+        .await
+        .unwrap();
+
+        let system_proc = host.system_proc().clone();
+        let host_agent = system_proc
+            .spawn(
+                HOST_MESH_AGENT_ACTOR_NAME,
+                HostAgent::new(HostAgentMode::Process {
+                    host,
+                    shutdown_tx: None,
+                }),
+            )
+            .unwrap();
+
+        let client_proc = Proc::direct(ChannelTransport::Unix.any(), "client".to_string()).unwrap();
+        let (client, _client_handle) = client_proc.instance("client").unwrap();
+
+        let name = Name::new("proc1").unwrap();
+        host_agent
+            .create_or_update(
+                &client,
+                name.clone(),
+                resource::Rank::new(0),
+                ProcSpec::default(),
+            )
+            .await
+            .unwrap();
+
+        // Wait for Stopped — should not reply yet.
+        let (port, mut rx) = client.open_port::<crate::StatusOverlay>();
+        host_agent
+            .wait_rank_status(
+                &client,
+                name.clone(),
+                resource::Status::Stopped,
+                port.bind(),
+            )
+            .await
+            .unwrap();
+
+        // Stop the proc.
+        host_agent
+            .stop(&client, name, "test".to_string())
+            .await
+            .unwrap();
+
+        // Now the reply should arrive.
+        let overlay = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("reply timed out — proc did not reach Stopped")
+            .expect("reply channel closed");
+        assert!(!overlay.is_empty(), "expected non-empty overlay");
+    }
+
+    /// WaitRankStatus sent before the proc is created — the waiter is
+    /// stashed and replied to once CreateOrUpdate runs.
+    #[tokio::test]
+    #[cfg(fbcode_build)]
+    async fn test_wait_rank_status_before_proc_exists() {
+        let host = Host::new(
+            BootstrapProcManager::new(BootstrapCommand::test()).unwrap(),
+            ChannelTransport::Unix.any(),
+        )
+        .await
+        .unwrap();
+
+        let system_proc = host.system_proc().clone();
+        let host_agent = system_proc
+            .spawn(
+                HOST_MESH_AGENT_ACTOR_NAME,
+                HostAgent::new(HostAgentMode::Process {
+                    host,
+                    shutdown_tx: None,
+                }),
+            )
+            .unwrap();
+
+        let client_proc = Proc::direct(ChannelTransport::Unix.any(), "client".to_string()).unwrap();
+        let (client, _client_handle) = client_proc.instance("client").unwrap();
+
+        let name = Name::new("proc1").unwrap();
+
+        // Wait for Running on a proc that doesn't exist yet.
+        let (port, mut rx) = client.open_port::<crate::StatusOverlay>();
+        host_agent
+            .wait_rank_status(
+                &client,
+                name.clone(),
+                resource::Status::Running,
+                port.bind(),
+            )
+            .await
+            .unwrap();
+
+        // Now create the proc — the stashed waiter should get its
+        // sentinel rank fixed and be flushed once the proc is Running.
+        host_agent
+            .create_or_update(&client, name, resource::Rank::new(0), ProcSpec::default())
+            .await
+            .unwrap();
+
+        let overlay = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("reply timed out — waiter was not flushed after CreateOrUpdate")
+            .expect("reply channel closed");
+        assert!(!overlay.is_empty(), "expected non-empty overlay");
     }
 }

@@ -14,7 +14,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperactor::ActorHandle;
 use hyperactor::ActorRef;
 use hyperactor::context;
 use hyperactor::reference;
@@ -36,9 +35,13 @@ use crate::backend::RdmaBackend;
 #[cfg(not(feature = "hixl"))]
 use crate::backend::ibverbs::IbvBuffer;
 #[cfg(not(feature = "hixl"))]
+use crate::backend::ibverbs::manager_actor::IbvBackend;
+#[cfg(not(feature = "hixl"))]
 use crate::backend::ibverbs::manager_actor::IbvManagerActor;
 #[cfg(not(feature = "hixl"))]
 use crate::backend::ibverbs::manager_actor::IbvManagerMessageClient;
+#[cfg(not(feature = "hixl"))]
+use crate::backend::tcp::manager_actor::TcpBackend;
 #[cfg(not(feature = "hixl"))]
 use crate::backend::tcp::manager_actor::TcpManagerActor;
 use crate::local_memory::RdmaLocalMemory;
@@ -63,8 +66,8 @@ wirevalue::register_type!(RdmaRemoteBuffer);
 #[cfg(not(feature = "hixl"))]
 #[derive(Debug)]
 pub enum RdmaLocalBackend {
-    Ibv(ActorHandle<IbvManagerActor>),
-    Tcp(ActorHandle<TcpManagerActor>),
+    Ibv(IbvBackend),
+    Tcp(TcpBackend),
 }
 
 #[cfg(not(feature = "hixl"))]
@@ -99,8 +102,8 @@ impl RdmaRemoteBuffer {
         client: &(impl context::Actor + Send + Sync),
     ) -> Result<RdmaLocalBackend, anyhow::Error> {
         if self.has_ibverbs_backend() {
-            if let Ok(ibv_backend) = IbvManagerActor::local_handle(client).await {
-                return Ok(RdmaLocalBackend::Ibv(ibv_backend));
+            if let Ok(ibv_handle) = IbvManagerActor::local_handle(client).await {
+                return Ok(RdmaLocalBackend::Ibv(IbvBackend(ibv_handle)));
             }
 
             return self
@@ -180,8 +183,8 @@ impl RdmaRemoteBuffer {
 
         tracing::warn!("falling back to TCP transport ({reason})");
 
-        let tcp_backend = TcpManagerActor::local_handle(client).await?;
-        Ok(RdmaLocalBackend::Tcp(tcp_backend))
+        let tcp_handle = TcpManagerActor::local_handle(client).await?;
+        Ok(RdmaLocalBackend::Tcp(TcpBackend(tcp_handle)))
     }
 
     // ----------------------------------------------------------------
@@ -395,11 +398,16 @@ pub async fn validate_execution_context() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Get all CUDA segments registered with MRs (GPU only).
+/// Get all segments that have been registered with MRs for the given PD.
+///
+/// Each protection domain maintains independent segment registrations, so
+/// callers must pass the PD whose lkeys they intend to use.
 #[cfg(not(feature = "hixl"))]
-pub fn get_registered_cuda_segments() -> Vec<rdmaxcel_sys::rdma_segment_info_t> {
+pub fn get_registered_cuda_segments(
+    pd: *mut rdmaxcel_sys::ibv_pd,
+) -> Vec<rdmaxcel_sys::rdma_segment_info_t> {
     unsafe {
-        let segment_count = rdmaxcel_sys::rdma_get_active_segment_count();
+        let segment_count = rdmaxcel_sys::rdma_get_active_segment_count(pd);
         if segment_count <= 0 {
             return Vec::new();
         }
@@ -409,8 +417,11 @@ pub fn get_registered_cuda_segments() -> Vec<rdmaxcel_sys::rdma_segment_info_t> 
                 .assume_init();
             segment_count as usize
         ];
-        let actual_count =
-            rdmaxcel_sys::rdma_get_all_segment_info(segments.as_mut_ptr(), segment_count);
+        let actual_count = rdmaxcel_sys::rdma_get_all_registered_segment_info(
+            pd,
+            segments.as_mut_ptr(),
+            segment_count,
+        );
 
         if actual_count > 0 {
             segments.truncate(actual_count as usize);
