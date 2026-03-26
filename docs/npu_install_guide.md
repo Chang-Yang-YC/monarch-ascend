@@ -2,6 +2,13 @@
 
 基于 Huawei Cloud EulerOS 2.0 + Ascend 910B 实测整理。
 
+## 版本历史
+
+| 日期 | torch | torch_npu | Monarch 分支 | 备注 |
+|------|-------|-----------|-------------|------|
+| 2026-03-26 | 2.8.0 | 2.8.0.post2 | ascend/actor-plan | 合并 origin/main（98 commits），Rust toolchain → nightly-2026-01-18 |
+| 2026-03-xx | 2.9.0 | 2.9.0 | ascend/actor-plan | 初始 Ascend NPU 支持 |
+
 ## 当前验证通过的环境
 
 | 组件 | 版本 | 备注 |
@@ -10,9 +17,9 @@
 | NPU | Ascend 910B1 × 8 | 每卡 64GB HBM |
 | CANN | 9.0.0-beta.1 | 自定义路径 `/root/hzz/cann-9.0.0-beta.1/` |
 | Python | 3.11.0 | conda 环境 `monarch_ascend` |
-| PyTorch | 2.9.0 | torch_npu 提供 NPU 后端 |
-| torch_npu | 2.9.0 | 与 CANN 9.0 配套 |
-| Rust | 1.93.0-nightly | 需要 nightly（`-Zthreads`、`tracing_unstable`）|
+| PyTorch | 2.8.0 | torch_npu 提供 NPU 后端 |
+| torch_npu | 2.8.0.post2 | 与 CANN 9.0 配套 |
+| Rust | 1.94.0-nightly (2026-01-18) | rust-toolchain 指定；需要 nightly（`-Zthreads`、`tracing_unstable`）|
 | clang | 12.0.1 | bindgen 需要 |
 | protobuf | 3.14.0 | protoc 编译器 |
 
@@ -67,8 +74,8 @@ conda activate monarch_ascend
 ### Step 3: 安装 PyTorch + torch_npu
 
 ```bash
-pip install torch==2.9.0
-pip install torch_npu==2.9.0
+pip install torch==2.8.0
+pip install torch_npu==2.8.0.post2
 ```
 
 验证：
@@ -86,9 +93,12 @@ print('NPU count:', torch.npu.device_count())
 
 > **⚠️ 坑 2: torch 和 torch_npu 版本必须严格匹配**
 >
-> torch 2.9.0 只能配 torch_npu 2.9.0。版本不匹配会导致
+> torch 2.8.0 只能配 torch_npu 2.8.0.post2。版本不匹配会导致
 > `RuntimeError: torch_npu is not compatible with the installed torch version`。
 > torch_npu 还要与 CANN 版本配套，具体对应关系见华为文档。
+>
+> 安装时会出现 `forge`、`torchstore` 等包对 `torch==2.9.0` 的依赖冲突警告，
+> 这些是环境中其他项目的版本约束，不影响 Monarch 本身功能，可忽略。
 >
 > **注意**：升级 torch 版本后必须重新编译 Monarch（Rust 扩展链接 libtorch ABI）。
 
@@ -117,10 +127,12 @@ protoc --version   # 需要能找到
 
 ### Step 5: 安装 Rust nightly
 
+项目根目录的 `rust-toolchain` 文件指定了所需的确切版本（当前为 `nightly-2026-01-18`）。
+rustup 会在首次编译时自动下载对应工具链。
+
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
-rustup default nightly
 ```
 
 验证：
@@ -129,6 +141,26 @@ rustup default nightly
 rustc --version   # 应显示 nightly
 cargo --version
 ```
+
+> **⚠️ 坑（网络受限环境）: rust-toolchain 工具链下载慢**
+>
+> `rust-toolchain` 会触发 rustup 自动下载指定版本（约 300-500 MB），
+> 网络受限时下载速度可能极慢（< 200 KB/s）甚至卡住。
+>
+> **绕过方法**：若已安装旧版 nightly（如 `nightly-2025-12-05`），
+> 可在编译命令前设置 `RUSTUP_TOOLCHAIN` 覆盖 `rust-toolchain`：
+>
+> ```bash
+> RUSTUP_TOOLCHAIN=nightly-2025-12-05 \
+>   USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 \
+>   pip install -e . --no-build-isolation
+> ```
+>
+> 新旧 nightly 版本通常兼容，仅 `edition = "2024"` 语法或新 unstable features
+> 才强依赖具体版本。若出现编译错误再安装正确版本：
+> ```bash
+> rustup toolchain install nightly-2026-01-18
+> ```
 
 ### Step 6: 安装 Python 依赖
 
@@ -153,8 +185,22 @@ export ASCEND_HOME=/root/hzz/cann-9.0.0-beta.1/aarch64-linux
 #### 方式一：pip install（推荐）
 
 ```bash
-USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e .
+export PYO3_PYTHON=$(which python)
+USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e . --no-build-isolation
 ```
+
+> **为什么需要 `--no-build-isolation`**
+>
+> pip 默认在隔离的临时环境里运行 build backend，会丢失当前激活的 conda 环境的
+> `torch`、CANN 路径等信息，导致 setup.py 找不到 libtorch 或 CANN 库。
+> `--no-build-isolation` 让 build backend 直接使用当前环境，保留所有环境变量。
+>
+> 若 `rust-toolchain` 指定的工具链尚未下载，可加 `RUSTUP_TOOLCHAIN` 绕过：
+> ```bash
+> RUSTUP_TOOLCHAIN=nightly-2025-12-05 \
+>   USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 \
+>   pip install -e . --no-build-isolation
+> ```
 
 #### 方式二：仅编译 Rust 后端
 
@@ -213,17 +259,25 @@ PYO3_PYTHON=$(which python) cargo build -p monarch_extension \
 
 ```bash
 # 1. 基础导入
-python -c "import monarch; print('monarch OK')"
+python -c "
+import torch, torch_npu, monarch, monarch._rust_bindings
+print('torch:', torch.__version__)
+print('NPU available:', torch.npu.is_available())
+print('NPU count:', torch.npu.device_count())
+print('monarch OK')
+"
 
-# 2. Rust 绑定加载
-python -c "import monarch._rust_bindings; print('rust bindings OK')"
+# 2. HiXL 桥接最小路径（跨 mesh RDMA read/write，约 30s）
+python tests/hixl/e2e/test_hixl_bridge_minimal.py
 
-# 3. GRPO 端到端测试（核心验收，需要至少 2 张卡）
-python tests/hixl/app/test_grpo_npu.py
-
-# 4. Ping-Pong 跨 mesh 通信
+# 3. Ping-Pong 跨 mesh 通信（含 NPU tensor 运算验证）
 python tests/hixl/app/test_ping_pong_npu.py
+
+# 4. GRPO 端到端训练测试（核心验收，需要至少 2 张卡，约 40s）
+python tests/hixl/app/test_grpo_npu.py
 ```
+
+三个脚本均以 `PASS` 或 `exit_code: 0` 结束为通过。
 
 ---
 
@@ -257,7 +311,7 @@ mesh_b = this_host().spawn_procs(per_host={"npus": 1}, bootstrap=npu_device(1))
 
 ### HiXL DMA 与 torch.npu.synchronize()
 
-torch 2.9 的 NPU 内存操作更加异步。在使用 HiXL DMA 传输前后必须调用
+NPU 内存操作是异步的。在使用 HiXL DMA 传输前后必须调用
 `torch.npu.synchronize()`，否则会出现竞态（例如 `torch.zeros()` 的零填充
 kernel 覆盖 DMA 写入的数据，导致 `read_into` 返回全零）：
 
@@ -346,5 +400,8 @@ python tests/hixl/bench_hixl_bandwidth.py 5 6
 | 6 | `libascendcl.so: cannot open` | 没 source CANN 环境 | `source /path/to/cann/set_env.sh` |
 | 7 | `_GLIBCXX_USE_CXX11_ABI` 链接错误 | C++ ABI 不匹配 | pip install 会自动处理；手动编译需加 `CXXFLAGS` |
 | 8 | pip install 编了 GPU 版本 | 环境有 CUDA，优先选了 tensor_engine | 显式 `USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e .` |
-| 9 | `read_into` 返回全零 | torch 2.9 异步零填充与 HiXL DMA 竞态 | `read_into` 前后都加 `torch.npu.synchronize()` |
-| 10 | 升级 torch 后 `import monarch` 崩溃 | Rust 扩展链接了旧 libtorch ABI | 重新 `USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e .` |
+| 9 | `read_into` 返回全零 | torch 异步零填充与 HiXL DMA 竞态 | `read_into` 前后都加 `torch.npu.synchronize()` |
+| 10 | 升级 torch 后 `import monarch` 崩溃 | Rust 扩展链接了旧 libtorch ABI | 重新 `USE_ASCEND_ENGINE=1 USE_TENSOR_ENGINE=0 pip install -e . --no-build-isolation` |
+| 11 | `pip install -e .` 时 `rustc -V` 卡住 | rust-toolchain 触发 rustup 下载新工具链，网络慢 | 设置 `RUSTUP_TOOLCHAIN=nightly-2025-12-05` 绕过，或等待下载完成 |
+| 12 | `pip install` 丢失 CANN/torch 路径 | pip 默认 build isolation 创建临时环境 | 始终加 `--no-build-isolation` |
+| 13 | merge 上游后 `could not find ibverbs/tcp in backend` | `rdma_components.rs` 的 `use` 语句缺少 `#[cfg(not(feature = "hixl"))]` | 在 `IbvManagerActor`/`TcpManagerActor` 的 `use` 行前加 `#[cfg(not(feature = "hixl"))]` |

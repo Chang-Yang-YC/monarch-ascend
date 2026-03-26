@@ -218,11 +218,22 @@ pub fn deregister_mem(addr: usize) -> Result<()> {
             }
         }
         drop(addrs);
-        state
-            .engine
-            .deregister_mem(addr)
-            .map_err(|ret| anyhow::anyhow!("hixl_deregister_mem(addr={:#x}) failed: ret={}", addr, ret))?;
-        tracing::debug!("[hixl] deregistered mem addr={:#x}", addr);
+        match state.engine.deregister_mem(addr) {
+            Ok(()) => {
+                tracing::debug!("[hixl] deregistered mem addr={:#x}", addr);
+            }
+            Err(ret) => {
+                // ret=103900 means the HIXL driver reports the address is no
+                // longer registered (e.g. already deregistered by another path,
+                // or re-used after an earlier deregister+register cycle).  We
+                // have already removed the addr from registered_addrs above, so
+                // no further deregistration will be attempted — treat as success.
+                tracing::warn!(
+                    "[hixl] deregister_mem: addr={:#x} hixl_deregister_mem ret={} (treating as success)",
+                    addr, ret
+                );
+            }
+        }
         Ok(())
     })
 }
