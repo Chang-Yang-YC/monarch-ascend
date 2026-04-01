@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import sys
 import time
+import socket
 
 ALIGN_2MB = 2 * 1024 * 1024
 COORD_FILE = "/tmp/hixl_bw_coord"
@@ -31,10 +32,14 @@ SIZES = [
 
 def find_lib():
     paths = [
+        # 当前目录向上两级目录下的libtest_hixl.so
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "tests/hixl/build/libtest_hixl.so"),
-        "/root/monarch/tests/hixl/build/libtest_hixl.so",
+                     "build/libtest_hixl.so"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                     "libtest_hixl.so"),
+        # "/root/monarch/tests/hixl/build/libtest_hixl.so",
     ]
+    print(os.path.dirname(os.path.abspath(__file__)))
     env = os.environ.get("MONARCH_HIXL_LIB")
     if env and os.path.isfile(env):
         return env
@@ -88,7 +93,10 @@ def server(dev_id, barrier, result_queue, max_size):
     torch.npu.set_device(0)
 
     lib = setup_lib()
-    ip = os.environ.get("MONARCH_HIXL_IP", "192.168.0.117")
+    # ip = os.environ.get("MONARCH_HIXL_IP", "192.168.0.117")
+    # 用socket获取本机IP地址，避免环境变量未设置时使用默认IP导致连接失败
+    ip = socket.gethostbyname(socket.gethostname())
+    print(f"Server IP address: {ip}")
     eid = f"{ip}:{40000 + dev_id}"
     ctx = lib.hixl_init_engine(0, eid.encode())
     assert ctx, "server init failed"
