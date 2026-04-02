@@ -50,6 +50,14 @@ def iter_sizes(max_size):
         yield size
         size *= 2
 
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+    finally:
+        s.close()
+    return local_ip
 
 def find_lib():
     paths = [
@@ -112,7 +120,7 @@ def server(dev_id, barrier, result_queue, max_size):
 
     lib = setup_lib()
     # 用socket获取本机IP地址，避免环境变量未设置时使用默认IP导致连接失败
-    ip = socket.gethostbyname(socket.gethostname())
+    ip = get_local_ip()
     eid = f"{ip}:{40000 + dev_id}"
     ctx = lib.hixl_init_engine(0, eid.encode())
     assert ctx, "server init failed"
